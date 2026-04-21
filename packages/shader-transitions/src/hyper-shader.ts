@@ -113,6 +113,9 @@ export function init(config: HyperShaderConfig): GsapTimeline {
     }
   }
 
+  // Locally redeclared (not imported) because @hyperframes/shader-transitions
+  // ships as a standalone CDN bundle and must not depend on @hyperframes/engine.
+  // Keep this in sync with HfTransitionMeta in packages/engine/src/types.ts.
   interface HfTransitionMeta {
     time: number;
     duration: number;

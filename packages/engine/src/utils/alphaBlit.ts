@@ -292,7 +292,7 @@ const SRGB_TO_HLG = buildSrgbToHdrLut("hlg");
 const SRGB_TO_PQ = buildSrgbToHdrLut("pq");
 
 /** Select the correct sRGB→HDR LUT for the given transfer function. */
-export function getSrgbToHdrLut(transfer: "hlg" | "pq"): Uint16Array {
+function getSrgbToHdrLut(transfer: "hlg" | "pq"): Uint16Array {
   return transfer === "pq" ? SRGB_TO_PQ : SRGB_TO_HLG;
 }
 

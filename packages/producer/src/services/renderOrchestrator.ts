@@ -1562,8 +1562,7 @@ export async function executeRenderJob(
           }
 
           // Composite layers bottom-to-top
-          for (let layerIdx = 0; layerIdx < layers.length; layerIdx++) {
-            const layer = layers[layerIdx]!;
+          for (const [layerIdx, layer] of layers.entries()) {
             if (layer.type === "hdr") {
               const before = shouldLog ? countNonZeroRgb48(canvas) : 0;
               const isHdrImage = nativeHdrImageIds.has(layer.element.id);
