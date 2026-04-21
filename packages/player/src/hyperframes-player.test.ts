@@ -797,3 +797,113 @@ describe("HyperframesPlayer seek() sync path", () => {
     expect(player._currentTime).toBe(11);
   });
 });
+
+describe("HyperframesPlayer srcdoc attribute", () => {
+  type PlayerInternal = HTMLElement & {
+    iframe: HTMLIFrameElement;
+    _ready: boolean;
+  };
+
+  beforeEach(async () => {
+    await import("./hyperframes-player.js");
+  });
+
+  it("includes srcdoc in observedAttributes", () => {
+    // `attributeChangedCallback` only fires for observed attributes. Without
+    // this, runtime srcdoc swaps from studio would silently drop on the floor.
+    const ctor = customElements.get("hyperframes-player") as
+      | (typeof HTMLElement & { observedAttributes: string[] })
+      | undefined;
+    expect(ctor).toBeDefined();
+    expect(ctor!.observedAttributes).toContain("srcdoc");
+  });
+
+  it("forwards an initial srcdoc attribute to the iframe on connect", () => {
+    // Studio's primary use case: render the player with composition HTML
+    // already in hand, no network round-trip. Setting the attribute before
+    // the element is connected must still apply on connect.
+    const player = document.createElement("hyperframes-player") as PlayerInternal;
+    const html = "<!doctype html><html><body>hello</body></html>";
+    player.setAttribute("srcdoc", html);
+    document.body.appendChild(player);
+
+    expect(player.iframe.getAttribute("srcdoc")).toBe(html);
+
+    player.remove();
+  });
+
+  it("forwards a srcdoc attribute set after connect to the iframe", () => {
+    // The composition-switching flow: same player element, new HTML.
+    // Without `attributeChangedCallback` wiring this would no-op.
+    const player = document.createElement("hyperframes-player") as PlayerInternal;
+    document.body.appendChild(player);
+
+    const html = "<!doctype html><html><body>after connect</body></html>";
+    player.setAttribute("srcdoc", html);
+
+    expect(player.iframe.getAttribute("srcdoc")).toBe(html);
+
+    player.remove();
+  });
+
+  it("resets _ready when srcdoc changes so onIframeLoad replays setup", () => {
+    // The ready flag gates probe intervals, controls hookup, and poster
+    // tear-down. Switching documents must invalidate it so the next `load`
+    // event re-runs that setup against the fresh window.
+    const player = document.createElement("hyperframes-player") as PlayerInternal;
+    document.body.appendChild(player);
+    player._ready = true;
+
+    player.setAttribute("srcdoc", "<!doctype html><html></html>");
+
+    expect(player._ready).toBe(false);
+
+    player.remove();
+  });
+
+  it("removes iframe.srcdoc when the attribute is removed so src can take over", () => {
+    // Per HTML spec, iframe.srcdoc beats iframe.src whenever both are
+    // present. Studio's fetch-fail fallback path needs srcdoc cleared so
+    // setting src afterwards actually navigates to that URL.
+    const player = document.createElement("hyperframes-player") as PlayerInternal;
+    player.setAttribute("srcdoc", "<!doctype html><html></html>");
+    document.body.appendChild(player);
+    expect(player.iframe.hasAttribute("srcdoc")).toBe(true);
+
+    player.removeAttribute("srcdoc");
+
+    expect(player.iframe.hasAttribute("srcdoc")).toBe(false);
+
+    player.remove();
+  });
+
+  it("treats an empty-string srcdoc as a deliberate empty document, not removal", () => {
+    // `setAttribute("srcdoc", "")` and `removeAttribute("srcdoc")` send
+    // different signals from the caller — empty string means "load a blank
+    // doc," removal means "fall back to src." We have to distinguish them.
+    const player = document.createElement("hyperframes-player") as PlayerInternal;
+    document.body.appendChild(player);
+
+    player.setAttribute("srcdoc", "");
+
+    expect(player.iframe.hasAttribute("srcdoc")).toBe(true);
+    expect(player.iframe.getAttribute("srcdoc")).toBe("");
+
+    player.remove();
+  });
+
+  it("forwards both src and srcdoc to the iframe and lets the browser arbitrate", () => {
+    // We deliberately don't strip src when srcdoc is set: the HTML spec
+    // already says srcdoc wins, and keeping both lets the browser fall back
+    // to src automatically if the embed re-renders without srcdoc.
+    const player = document.createElement("hyperframes-player") as PlayerInternal;
+    player.setAttribute("src", "/api/projects/foo/preview");
+    player.setAttribute("srcdoc", "<!doctype html><html></html>");
+    document.body.appendChild(player);
+
+    expect(player.iframe.getAttribute("src")).toBe("/api/projects/foo/preview");
+    expect(player.iframe.getAttribute("srcdoc")).toBe("<!doctype html><html></html>");
+
+    player.remove();
+  });
+});

@@ -8,7 +8,17 @@ const RUNTIME_CDN_URL =
 
 class HyperframesPlayer extends HTMLElement {
   static get observedAttributes() {
-    return ["src", "width", "height", "controls", "muted", "poster", "playback-rate", "audio-src"];
+    return [
+      "src",
+      "srcdoc",
+      "width",
+      "height",
+      "controls",
+      "muted",
+      "poster",
+      "playback-rate",
+      "audio-src",
+    ];
   }
 
   private shadow: ShadowRoot;
@@ -135,6 +145,9 @@ class HyperframesPlayer extends HTMLElement {
     if (this.hasAttribute("poster")) this._setupPoster();
     if (this.hasAttribute("audio-src"))
       this._setupParentAudioFromUrl(this.getAttribute("audio-src")!);
+    // srcdoc wins over src per HTML spec when both are set; mirror both attributes
+    // so the browser applies the standard precedence rules.
+    if (this.hasAttribute("srcdoc")) this.iframe.srcdoc = this.getAttribute("srcdoc")!;
     if (this.hasAttribute("src")) this.iframe.src = this.getAttribute("src")!;
   }
 
@@ -159,6 +172,14 @@ class HyperframesPlayer extends HTMLElement {
           this._ready = false;
           this.iframe.src = val;
         }
+        break;
+      case "srcdoc":
+        // Distinguish removal (null) from empty-string ("") so callers can clear
+        // srcdoc and let src take over. Always reset readiness; the iframe will
+        // load a new document either way.
+        this._ready = false;
+        if (val !== null) this.iframe.srcdoc = val;
+        else this.iframe.removeAttribute("srcdoc");
         break;
       case "width":
         this._compositionWidth = parseInt(val || "1920", 10);
