@@ -99,6 +99,10 @@ import {
 import { defaultLogger, type ProducerLogger } from "../logger.js";
 import { isPathInside } from "../utils/paths.js";
 import { clearMaxFrameIndex, getMaxFrameIndex } from "./frameDirCache.js";
+import {
+  type HdrImageTransferCache,
+  createHdrImageTransferCache,
+} from "./hdrImageTransferCache.js";
 
 /**
  * Wrap a cleanup operation so it never throws, but logs any failure.
@@ -529,6 +533,7 @@ function blitHdrImageLayer(
   canvas: Buffer,
   el: ElementStackingInfo,
   hdrImageBuffers: Map<string, HdrImageBuffer>,
+  hdrImageTransferCache: HdrImageTransferCache,
   width: number,
   height: number,
   log?: ProducerLogger,
@@ -541,13 +546,13 @@ function blitHdrImageLayer(
   }
 
   try {
-    let hdrRgb = buf.data;
-    if (sourceTransfer && targetTransfer && sourceTransfer !== targetTransfer) {
-      // convertTransfer mutates in place; copy first so the cached decode stays
-      // pristine for subsequent frames.
-      hdrRgb = Buffer.from(buf.data);
-      convertTransfer(hdrRgb, sourceTransfer, targetTransfer);
-    }
+    // The cache returns `buf.data` unchanged when no conversion is needed,
+    // and otherwise returns a per-(imageId, targetTransfer) buffer that was
+    // converted exactly once and reused across every subsequent frame.
+    const hdrRgb =
+      sourceTransfer && targetTransfer
+        ? hdrImageTransferCache.getConverted(el.id, sourceTransfer, targetTransfer, buf.data)
+        : buf.data;
 
     const viewportMatrix = parseTransformMatrix(el.transform);
 
@@ -608,6 +613,7 @@ interface HdrCompositeContext {
   effectiveHdr: { transfer: HdrTransfer };
   nativeHdrImageIds: Set<string>;
   hdrImageBuffers: Map<string, HdrImageBuffer>;
+  hdrImageTransferCache: HdrImageTransferCache;
   hdrFrameDirs: Map<string, string>;
   hdrVideoStartTimes: Map<string, number>;
   imageTransfers: Map<string, HdrTransfer>;
@@ -661,6 +667,7 @@ async function compositeHdrFrame(
     effectiveHdr,
     nativeHdrImageIds,
     hdrImageBuffers,
+    hdrImageTransferCache,
     hdrFrameDirs,
     hdrVideoStartTimes,
     imageTransfers,
@@ -708,6 +715,7 @@ async function compositeHdrFrame(
           canvas,
           layer.element,
           hdrImageBuffers,
+          hdrImageTransferCache,
           width,
           height,
           log,
@@ -1892,6 +1900,13 @@ export async function executeRenderJob(
               "Internal: HDR render path entered without effectiveHdr — this is a bug.",
             );
           }
+          // Per-job LRU cache for transfer-converted HDR image buffers. Static HDR
+          // images that need PQ↔HLG conversion are converted exactly once per
+          // (imageId, targetTransfer) and then reused for every subsequent frame
+          // instead of paying a fresh `Buffer.from` + `convertTransfer` on every
+          // composite. The cache is local to this render job so concurrent renders
+          // do not share state.
+          const hdrImageTransferCache = createHdrImageTransferCache();
           const hdrCompositeCtx: HdrCompositeContext = {
             log,
             domSession,
@@ -1902,6 +1917,7 @@ export async function executeRenderJob(
             effectiveHdr,
             nativeHdrImageIds,
             hdrImageBuffers,
+            hdrImageTransferCache,
             hdrFrameDirs,
             hdrVideoStartTimes,
             imageTransfers,
@@ -2021,6 +2037,7 @@ export async function executeRenderJob(
                       sceneBuf as Buffer,
                       el,
                       hdrImageBuffers,
+                      hdrImageTransferCache,
                       width,
                       height,
                       log,
