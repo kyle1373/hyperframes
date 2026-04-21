@@ -10,7 +10,11 @@ import { existsSync, mkdirSync, readdirSync, rmSync } from "fs";
 import { join } from "path";
 import { parseHTML } from "linkedom";
 import { extractVideoMetadata, type VideoMetadata } from "../utils/ffprobe.js";
-import { isHdrColorSpace as isHdrColorSpaceUtil } from "../utils/hdr.js";
+import {
+  analyzeCompositionHdr,
+  isHdrColorSpace as isHdrColorSpaceUtil,
+  type HdrTransfer,
+} from "../utils/hdr.js";
 import { downloadToTemp, isHttpUrl } from "../utils/urlDownloader.js";
 import { runFfmpeg } from "../utils/runFfmpeg.js";
 import { DEFAULT_CONFIG, type EngineConfig } from "../config.js";
@@ -250,20 +254,27 @@ export async function extractVideoFramesRange(
 }
 
 /**
- * Convert an SDR video to HDR color space (HLG / BT.2020) so it can be
- * composited alongside HDR content without looking washed out.
+ * Convert an SDR (BT.709) video to BT.2020 wide-gamut so it can be composited
+ * alongside HDR content without looking washed out.
  *
- * Uses zscale for color space conversion with a nominal peak luminance of
- * 600 nits — high enough that SDR content doesn't appear too dark next to
- * HDR, matching the approach used by HeyGen's Rio pipeline.
+ * Uses FFmpeg's `colorspace` filter to remap BT.709 → BT.2020 (no real tone
+ * mapping — just a primaries swap so the input fits inside the wider HDR
+ * gamut), then re-tags the stream with the caller's target HDR transfer
+ * function (PQ for HDR10, HLG for broadcast HDR). The output transfer must
+ * match the dominant transfer of the surrounding HDR content; otherwise the
+ * downstream encoder will tag the final video with the wrong curve.
  */
 async function convertSdrToHdr(
   inputPath: string,
   outputPath: string,
+  targetTransfer: HdrTransfer,
   signal?: AbortSignal,
   config?: Partial<Pick<EngineConfig, "ffmpegProcessTimeout">>,
 ): Promise<void> {
   const timeout = config?.ffmpegProcessTimeout ?? DEFAULT_CONFIG.ffmpegProcessTimeout;
+
+  // smpte2084 = PQ (HDR10), arib-std-b67 = HLG.
+  const colorTrc = targetTransfer === "pq" ? "smpte2084" : "arib-std-b67";
 
   const args = [
     "-i",
@@ -273,7 +284,7 @@ async function convertSdrToHdr(
     "-color_primaries",
     "bt2020",
     "-color_trc",
-    "arib-std-b67",
+    colorTrc,
     "-colorspace",
     "bt2020nc",
     "-c:v",
@@ -401,8 +412,9 @@ export async function extractAllVideoFrames(
     }),
   );
 
-  const hasAnyHdr = videoColorSpaces.some(isHdrColorSpaceUtil);
-  if (hasAnyHdr) {
+  const hdrInfo = analyzeCompositionHdr(videoColorSpaces);
+  if (hdrInfo.hasHdr && hdrInfo.dominantTransfer) {
+    const targetTransfer = hdrInfo.dominantTransfer;
     const convertDir = join(options.outputDir, "_hdr_normalized");
     mkdirSync(convertDir, { recursive: true });
 
@@ -410,12 +422,13 @@ export async function extractAllVideoFrames(
       if (signal?.aborted) break;
       const cs = videoColorSpaces[i] ?? null;
       if (!isHdrColorSpaceUtil(cs)) {
-        // SDR video in a mixed timeline — convert to HDR color space
+        // SDR video in a mixed timeline — convert to the dominant HDR transfer
+        // so the encoder tags the final video correctly (PQ vs HLG).
         const entry = resolvedVideos[i];
         if (!entry) continue;
         const convertedPath = join(convertDir, `${entry.video.id}_hdr.mp4`);
         try {
-          await convertSdrToHdr(entry.videoPath, convertedPath, signal, config);
+          await convertSdrToHdr(entry.videoPath, convertedPath, targetTransfer, signal, config);
           entry.videoPath = convertedPath;
         } catch (err) {
           errors.push({
