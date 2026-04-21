@@ -1,0 +1,200 @@
+#!/usr/bin/env bun
+/**
+ * Player Performance Test Runner
+ *
+ * Boots a static server, launches puppeteer-core against locally-served fixtures,
+ * runs the configured scenarios, then evaluates the collected metrics against
+ * baseline.json via perf-gate.
+ *
+ * Usage:
+ *   bun run packages/player/tests/perf/index.ts
+ *   bun run packages/player/tests/perf/index.ts --mode enforce
+ *   bun run packages/player/tests/perf/index.ts --scenarios load
+ *   bun run packages/player/tests/perf/index.ts --runs 5 --headful
+ *
+ * Flags:
+ *   --mode <measure|enforce>   default: PLAYER_PERF_MODE env or "measure"
+ *   --scenarios <list>         comma-separated scenario ids; default: all enabled
+ *   --runs <n>                 override per-scenario run count
+ *   --fixture <name>           single fixture (default: every fixture in fixtures/)
+ *   --headful                  show the browser; default: headless
+ *
+ * Exit codes:
+ *   0  all pass (or measure mode)
+ *   1  scenario crashed
+ *   2  perf gate failed in enforce mode
+ */
+
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { runLoad } from "./scenarios/03-load.ts";
+import { reportAndGate, type GateMode, type GateResult, type Metric } from "./perf-gate.ts";
+import { launchBrowser } from "./runner.ts";
+import { startServer } from "./server.ts";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const RESULTS_DIR = resolve(HERE, "results");
+const RESULTS_FILE = resolve(RESULTS_DIR, "metrics.json");
+
+type ScenarioId = "load";
+
+type ResultsFile = {
+  schemaVersion: 1;
+  timestamp: string;
+  gitSha: string | null;
+  mode: GateMode;
+  scenarios: ScenarioId[];
+  runs: number | null;
+  fixture: string | null;
+  crashed: boolean;
+  passed: boolean;
+  metrics: Metric[];
+  gate: GateResult[];
+};
+
+function readGitSha(): string | null {
+  try {
+    return execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf-8" }).trim();
+  } catch {
+    return null;
+  }
+}
+
+function writeResults(file: ResultsFile): void {
+  if (!existsSync(RESULTS_DIR)) {
+    mkdirSync(RESULTS_DIR, { recursive: true });
+  }
+  writeFileSync(RESULTS_FILE, JSON.stringify(file, null, 2) + "\n");
+  console.log(`[player-perf] wrote results to ${RESULTS_FILE}`);
+}
+
+type ParsedArgs = {
+  mode: GateMode;
+  scenarios: ScenarioId[];
+  runs: number | null;
+  fixture: string | null;
+  headful: boolean;
+};
+
+function parseArgs(argv: string[]): ParsedArgs {
+  const result: ParsedArgs = {
+    // TODO(player-perf): once baselines have settled on CI for ~1–2 weeks and we
+    // are confident there are no false positives from runner jitter, flip this
+    // default from "measure" to "enforce" — that single line + bumping the
+    // workflow's `--mode=measure` flag in .github/workflows/player-perf.yml is
+    // the entire opt-in. See packages/player/tests/perf/perf-gate.ts for how
+    // `mode` is consumed (measure logs regressions but never fails; enforce
+    // exits non-zero on regression).
+    mode: (process.env.PLAYER_PERF_MODE as GateMode) === "enforce" ? "enforce" : "measure",
+    scenarios: ["load"],
+    runs: null,
+    fixture: null,
+    headful: false,
+  };
+  // Normalize `--key=value` into `[--key, value]` so the rest of the loop
+  // only has to handle the space-separated form.
+  const tokens: string[] = [];
+  for (const raw of argv.slice(2)) {
+    if (raw.startsWith("--") && raw.includes("=")) {
+      const eq = raw.indexOf("=");
+      tokens.push(raw.slice(0, eq), raw.slice(eq + 1));
+    } else {
+      tokens.push(raw);
+    }
+  }
+  for (let i = 0; i < tokens.length; i++) {
+    const arg = tokens[i];
+    const next = tokens[i + 1];
+    if (arg === "--mode" && next) {
+      if (next !== "measure" && next !== "enforce") {
+        throw new Error(`--mode must be measure|enforce, got ${next}`);
+      }
+      result.mode = next;
+      i++;
+    } else if (arg === "--scenarios" && next) {
+      result.scenarios = next.split(",").map((s) => s.trim()) as ScenarioId[];
+      i++;
+    } else if (arg === "--runs" && next) {
+      result.runs = parseInt(next, 10);
+      i++;
+    } else if (arg === "--fixture" && next) {
+      result.fixture = next;
+      i++;
+    } else if (arg === "--headful") {
+      result.headful = true;
+    }
+  }
+  return result;
+}
+
+async function main(): Promise<void> {
+  const args = parseArgs(process.argv);
+  console.log(
+    `[player-perf] starting: mode=${args.mode} scenarios=${args.scenarios.join(",")} runs=${args.runs ?? "default"} fixture=${args.fixture ?? "all"}`,
+  );
+
+  const server = startServer();
+  console.log(`[player-perf] server listening at ${server.origin}`);
+
+  const browser = await launchBrowser({ headless: !args.headful });
+  console.log("[player-perf] browser launched");
+
+  const metrics: Metric[] = [];
+  let crashed = false;
+
+  try {
+    for (const scenario of args.scenarios) {
+      if (scenario === "load") {
+        const m = await runLoad({
+          browser,
+          origin: server.origin,
+          runs: args.runs ?? 5,
+          fixture: args.fixture,
+        });
+        metrics.push(...m);
+      } else {
+        console.warn(`[player-perf] unknown scenario: ${scenario}`);
+      }
+    }
+  } catch (err) {
+    crashed = true;
+    console.error("[player-perf] scenario crashed:", err);
+  } finally {
+    await browser.close();
+    await server.stop();
+  }
+
+  let report: { passed: boolean; rows: GateResult[] } = { passed: !crashed, rows: [] };
+  if (!crashed && metrics.length > 0) {
+    report = reportAndGate(metrics, args.mode);
+  }
+
+  writeResults({
+    schemaVersion: 1,
+    timestamp: new Date().toISOString(),
+    gitSha: readGitSha(),
+    mode: args.mode,
+    scenarios: args.scenarios,
+    runs: args.runs,
+    fixture: args.fixture,
+    crashed,
+    passed: report.passed && !crashed,
+    metrics,
+    gate: report.rows,
+  });
+
+  if (crashed) {
+    process.exit(1);
+  }
+  if (!report.passed) {
+    process.exit(2);
+  }
+  process.exit(0);
+}
+
+main().catch((err) => {
+  console.error("[player-perf] fatal:", err);
+  process.exit(1);
+});
