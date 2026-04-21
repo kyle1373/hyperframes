@@ -3,7 +3,7 @@
   "description": "HDR10 (BT.2020 PQ) regression suite. Four windows (A–D) cover the highest-value HDR compositing shapes: direct <video> opacity tween (A), z-order DOM/HDR/DOM sandwich (B), transform + border-radius (C), and a shader transition between HDR video and HDR PQ image (D). 10s / 300 frames at 30fps.",
   "tags": ["regression", "hdr"],
   "minPsnr": 28,
-  "maxFrameFailures": 30,
+  "maxFrameFailures": 5,
   "minAudioCorrelation": 0,
   "maxAudioLagWindows": 1,
   "renderConfig": {
