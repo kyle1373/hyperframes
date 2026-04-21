@@ -1186,6 +1186,14 @@ export async function executeRenderJob(
     const encoderHdr = hasHdrContent ? effectiveHdr : undefined;
     const preset = getEncoderPreset(job.config.quality, outputFormat, encoderHdr);
 
+    // CLI overrides (--crf, --video-bitrate) flow through job.config and must
+    // win over the preset-derived defaults. The CLI enforces mutual exclusivity
+    // upstream, but we still resolve them defensively. Without this, the flags
+    // are silently ignored at the encoder spawn sites below — see PR #268 which
+    // dropped the prior baseEncoderOpts wiring.
+    const effectiveQuality = job.config.crf ?? preset.quality;
+    const effectiveBitrate = job.config.videoBitrate;
+
     job.framesRendered = 0;
 
     // ── HDR z-ordered multi-layer compositing ──────────────────────────────
@@ -1316,7 +1324,8 @@ export async function executeRenderJob(
             height,
             codec: preset.codec,
             preset: preset.preset,
-            quality: preset.quality,
+            quality: effectiveQuality,
+            bitrate: effectiveBitrate,
             pixelFormat: preset.pixelFormat,
             hdr: preset.hdr,
             rawInputFormat: "rgb48le",
@@ -2033,7 +2042,8 @@ export async function executeRenderJob(
             height,
             codec: preset.codec,
             preset: preset.preset,
-            quality: preset.quality,
+            quality: effectiveQuality,
+            bitrate: effectiveBitrate,
             pixelFormat: preset.pixelFormat,
             useGpu: job.config.useGpu,
             imageFormat: captureOptions.format || "jpeg",
@@ -2259,7 +2269,8 @@ export async function executeRenderJob(
             height,
             codec: preset.codec,
             preset: preset.preset,
-            quality: preset.quality,
+            quality: effectiveQuality,
+            bitrate: effectiveBitrate,
             pixelFormat: preset.pixelFormat,
             useGpu: job.config.useGpu,
             hdr: preset.hdr,
