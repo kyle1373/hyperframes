@@ -61,6 +61,14 @@ interface TransState {
   progress: number;
 }
 
+// Defaults for transition duration/ease. Used by every fallback site in this
+// file — meta-write, browser/render mode, and engine mode — so a transition
+// without explicit `duration`/`ease` plays the same length and curve in
+// preview, the engine's deterministic seek path, and the metadata the
+// producer reads to plan compositing.
+const DEFAULT_DURATION = 0.7;
+const DEFAULT_EASE = "power2.inOut";
+
 function parseHex(hex: string): [number, number, number] {
   const h = hex.replace("#", "");
   if (h.length < 6) return [0.5, 0.5, 0.5];
@@ -130,9 +138,9 @@ export function init(config: HyperShaderConfig): GsapTimeline {
     if (hfWin.__hf) {
       hfWin.__hf.transitions = transitions.map((t: TransitionConfig, i: number) => ({
         time: t.time,
-        duration: t.duration ?? 1,
+        duration: t.duration ?? DEFAULT_DURATION,
         shader: t.shader,
-        ease: t.ease ?? "none",
+        ease: t.ease ?? DEFAULT_EASE,
         fromScene: scenes[i] ?? "",
         toScene: scenes[i + 1] ?? "",
       }));
@@ -238,8 +246,8 @@ export function init(config: HyperShaderConfig): GsapTimeline {
     const prog = programs.get(t.shader);
     if (!prog) continue;
 
-    const dur = t.duration ?? 0.7;
-    const ease = t.ease ?? "power2.inOut";
+    const dur = t.duration ?? DEFAULT_DURATION;
+    const ease = t.ease ?? DEFAULT_EASE;
     const T = t.time;
 
     // Pause timeline during async capture to prevent the progress tween
@@ -361,7 +369,7 @@ function initEngineMode(
     const toId = scenes[i + 1];
     if (!fromId || !toId) continue;
 
-    const dur = t.duration ?? 0.7;
+    const dur = t.duration ?? DEFAULT_DURATION;
     const T = t.time;
 
     // During the transition both scenes need to be visible so the engine
