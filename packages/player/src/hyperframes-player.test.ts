@@ -362,3 +362,81 @@ describe("HyperframesPlayer adoptedStyleSheets", () => {
     expect(player.shadowRoot?.querySelector("style")).toBeNull();
   });
 });
+
+// ── Media MutationObserver scoping ──
+//
+// The observer that catches late-attached `<audio data-start>` from
+// sub-composition activation used to watch `iframe.contentDocument.body`
+// wholesale. That fired on every body-level mutation — analytics scripts,
+// runtime telemetry markers, dev-only overlays — even though only
+// composition-tree changes can introduce new timed media. The fix is to
+// scope per top-level composition host (see `selectMediaObserverTargets`);
+// these tests verify the player honors that scoping.
+
+describe("HyperframesPlayer media MutationObserver scoping", () => {
+  type PlayerInternal = HTMLElement & {
+    _observeDynamicMedia?: (doc: Document) => void;
+  };
+
+  beforeEach(async () => {
+    await import("./hyperframes-player.js");
+  });
+
+  afterEach(() => {
+    document.body.innerHTML = "";
+    vi.restoreAllMocks();
+  });
+
+  it("attaches the observer to each top-level composition host (not the body)", () => {
+    const observeSpy = vi.spyOn(MutationObserver.prototype, "observe");
+
+    const player = document.createElement("hyperframes-player") as PlayerInternal;
+    document.body.appendChild(player);
+    // The constructor doesn't install an observer — only `_observeDynamicMedia`
+    // does — so the spy starts clean for the call we care about.
+    observeSpy.mockClear();
+
+    // Simulates the iframe document the runtime hands the player after mount.
+    // Bypassing the iframe lifecycle keeps the test deterministic; the
+    // selection logic itself is exercised in `mediaObserverScope.test.ts`.
+    const fakeDoc = document.implementation.createHTMLDocument("test");
+    fakeDoc.body.innerHTML = `
+      <div data-composition-id="root-a"></div>
+      <div data-composition-id="root-b"></div>
+      <script>// runtime telemetry — body-level, must NOT be observed</script>
+    `;
+
+    player._observeDynamicMedia?.(fakeDoc);
+
+    expect(observeSpy).toHaveBeenCalledTimes(2);
+    const observedTargets = observeSpy.mock.calls.map((call) => call[0]);
+    expect(observedTargets.map((t) => (t as Element).getAttribute("data-composition-id"))).toEqual([
+      "root-a",
+      "root-b",
+    ]);
+    expect(observedTargets).not.toContain(fakeDoc.body);
+    // Subtree is still required — sub-composition media can be deeply nested
+    // inside the host (e.g. wrapper div around the `<audio>`).
+    for (const call of observeSpy.mock.calls) {
+      expect(call[1]).toEqual({ childList: true, subtree: true });
+    }
+  });
+
+  it("falls back to observing the document body when no composition hosts exist", () => {
+    // Preserves the legacy behavior for documents that haven't bootstrapped
+    // a composition tree yet (e.g. a blank iframe between src changes).
+    const observeSpy = vi.spyOn(MutationObserver.prototype, "observe");
+
+    const player = document.createElement("hyperframes-player") as PlayerInternal;
+    document.body.appendChild(player);
+    observeSpy.mockClear();
+
+    const fakeDoc = document.implementation.createHTMLDocument("test");
+    fakeDoc.body.innerHTML = `<div class="not-a-composition"></div>`;
+
+    player._observeDynamicMedia?.(fakeDoc);
+
+    expect(observeSpy).toHaveBeenCalledTimes(1);
+    expect(observeSpy.mock.calls[0]?.[0]).toBe(fakeDoc.body);
+  });
+});
