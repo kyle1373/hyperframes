@@ -18,7 +18,6 @@ import {
   mkdirSync,
   rmSync,
   readFileSync,
-  readdirSync,
   writeFileSync,
   copyFileSync,
   appendFileSync,
@@ -99,6 +98,7 @@ import {
 } from "./htmlCompiler.js";
 import { defaultLogger, type ProducerLogger } from "../logger.js";
 import { isPathInside } from "../utils/paths.js";
+import { clearMaxFrameIndex, getMaxFrameIndex } from "./frameDirCache.js";
 
 /**
  * Wrap a cleanup operation so it never throws, but logs any failure.
@@ -117,38 +117,10 @@ async function safeCleanup(
   }
 }
 
-/**
- * Cache of the maximum 1-based frame index present in each pre-extracted frame
- * directory (e.g. `frame_0001.png … frame_0150.png` → 150). The directory is
- * read once on first access and the max is computed by parsing filenames.
- *
- * Used to bounds-check `videoFrameIndex` against the directory size before
- * calling `existsSync` per frame, which avoids redundant filesystem syscalls
- * when the requested time falls past the last extracted frame (e.g. a clip
- * shorter than the composition's effective video range).
- */
-const frameDirMaxIndexCache = new Map<string, number>();
-
-const FRAME_FILENAME_RE = /^frame_(\d+)\.png$/;
-
-function getMaxFrameIndex(frameDir: string): number {
-  const cached = frameDirMaxIndexCache.get(frameDir);
-  if (cached !== undefined) return cached;
-  let max = 0;
-  try {
-    for (const name of readdirSync(frameDir)) {
-      const m = FRAME_FILENAME_RE.exec(name);
-      if (!m) continue;
-      const n = Number(m[1]);
-      if (Number.isFinite(n) && n > max) max = n;
-    }
-  } catch {
-    // Directory missing or unreadable → max stays 0; downstream existsSync
-    // check will still produce the right "no frame" outcome.
-  }
-  frameDirMaxIndexCache.set(frameDir, max);
-  return max;
-}
+// Frame-directory max-index cache lives in its own module so the cross-job
+// isolation contract (Chunk 5B) can be unit-tested directly. See
+// ./frameDirCache.ts. Callers MUST call `clearMaxFrameIndex(frameDir)` for
+// every directory they registered, in their cleanup path.
 
 // Diagnostic helpers used by the HDR layered compositor when KEEP_TEMP=1
 // is set. They are pure (capture no state), so we keep them at module scope
@@ -1580,7 +1552,7 @@ export async function executeRenderJob(
       let hdrEncoderClosed = false;
       let domSessionClosed = false;
       // Track HDR video frame directories at this scope so the outer finally
-      // can clear their entries from the module-scoped frameDirMaxIndexCache.
+      // can clear their entries via clearMaxFrameIndex (frameDirCache.ts).
       // Without this, the cache leaks one entry per HDR video per render.
       const hdrFrameDirs = new Map<string, string>();
       try {
@@ -1746,7 +1718,7 @@ export async function executeRenderJob(
 
         // ── Pre-extract all HDR video frames in a single FFmpeg pass ──────
         // hdrFrameDirs is declared above the try block so the outer finally
-        // can clear matching frameDirMaxIndexCache entries on any exit path.
+        // can clear matching frame-dir cache entries on any exit path.
         for (const [videoId, srcPath] of hdrVideoSrcPaths) {
           const video = composition.videos.find((v) => v.id === videoId);
           if (!video) continue;
@@ -2110,7 +2082,7 @@ export async function executeRenderJob(
                       // max-frame-index reading for a directory that no longer
                       // exists. Without this, the module-scoped cache grows
                       // monotonically across renders.
-                      frameDirMaxIndexCache.delete(frameDir);
+                      clearMaxFrameIndex(frameDir);
                       hdrFrameDirs.delete(videoId);
                     }
                     cleanedUpVideos.add(videoId);
@@ -2168,13 +2140,13 @@ export async function executeRenderJob(
             });
           });
         }
-        // Drop frameDirMaxIndexCache entries for any HDR frame directories
-        // that survived the in-loop cleanup (early failures, KEEP_TEMP=1,
-        // videos still active when the render exits). The on-disk frames
-        // themselves are torn down with workDir; we just don't want the
-        // module-scoped cache to leak entries across renders.
+        // Drop frame-dir cache entries for any HDR frame directories that
+        // survived the in-loop cleanup (early failures, KEEP_TEMP=1, videos
+        // still active when the render exits). The on-disk frames themselves
+        // are torn down with workDir; we just don't want the module-scoped
+        // cache to leak entries across renders.
         for (const frameDir of hdrFrameDirs.values()) {
-          frameDirMaxIndexCache.delete(frameDir);
+          clearMaxFrameIndex(frameDir);
         }
         hdrFrameDirs.clear();
       }
