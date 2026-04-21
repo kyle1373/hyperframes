@@ -9,7 +9,7 @@ import { spawn } from "child_process";
 import { existsSync, mkdirSync, readdirSync, rmSync } from "fs";
 import { join } from "path";
 import { parseHTML } from "linkedom";
-import { extractVideoMetadata, type VideoMetadata } from "../utils/ffprobe.js";
+import { extractMediaMetadata, type VideoMetadata } from "../utils/ffprobe.js";
 import {
   analyzeCompositionHdr,
   isHdrColorSpace as isHdrColorSpaceUtil,
@@ -158,7 +158,7 @@ export async function extractVideoFramesRange(
   const videoOutputDir = join(outputDir, videoId);
   if (!existsSync(videoOutputDir)) mkdirSync(videoOutputDir, { recursive: true });
 
-  const metadata = await extractVideoMetadata(videoPath);
+  const metadata = await extractMediaMetadata(videoPath);
   const framePattern = `frame_%05d.${format}`;
   const outputPattern = join(videoOutputDir, framePattern);
 
@@ -407,7 +407,7 @@ export async function extractAllVideoFrames(
   // Phase 2: Probe color spaces and normalize if mixed HDR/SDR
   const videoColorSpaces = await Promise.all(
     resolvedVideos.map(async ({ videoPath }) => {
-      const metadata = await extractVideoMetadata(videoPath);
+      const metadata = await extractMediaMetadata(videoPath);
       return metadata.colorSpace;
     }),
   );
@@ -453,7 +453,7 @@ export async function extractAllVideoFrames(
     if (signal?.aborted) break;
     const entry = resolvedVideos[i];
     if (!entry) continue;
-    const metadata = await extractVideoMetadata(entry.videoPath);
+    const metadata = await extractMediaMetadata(entry.videoPath);
     if (!metadata.isVFR) continue;
 
     let segDuration = entry.video.end - entry.video.start;
@@ -499,7 +499,7 @@ export async function extractAllVideoFrames(
         // Fallback: if no data-duration/data-end was specified (end is Infinity or 0),
         // probe the actual video file to get its natural duration.
         if (!Number.isFinite(videoDuration) || videoDuration <= 0) {
-          const metadata = await extractVideoMetadata(videoPath);
+          const metadata = await extractMediaMetadata(videoPath);
           const sourceDuration = metadata.durationSeconds - video.mediaStart;
           videoDuration = sourceDuration > 0 ? sourceDuration : metadata.durationSeconds;
           video.end = video.start + videoDuration;
