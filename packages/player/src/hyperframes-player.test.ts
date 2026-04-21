@@ -322,3 +322,43 @@ describe("HyperframesPlayer parent-frame media", () => {
     expect(mockAudio.muted).toBe(false);
   });
 });
+
+// ── Shared stylesheet (adoptedStyleSheets) ──
+//
+// Every player constructed in the same document should adopt the *same*
+// CSSStyleSheet instance instead of getting its own <style> element. This is
+// the studio thumbnail-grid win — N players, one parsed sheet.
+
+describe("HyperframesPlayer adoptedStyleSheets", () => {
+  type AdoptingShadowRoot = ShadowRoot & { adoptedStyleSheets: CSSStyleSheet[] };
+  type PlayerWithShadow = HTMLElement & { shadowRoot: AdoptingShadowRoot | null };
+
+  beforeEach(async () => {
+    await import("./hyperframes-player.js");
+  });
+
+  afterEach(() => {
+    document.body.innerHTML = "";
+  });
+
+  it("shares a single CSSStyleSheet across multiple player instances", () => {
+    const a = document.createElement("hyperframes-player") as PlayerWithShadow;
+    const b = document.createElement("hyperframes-player") as PlayerWithShadow;
+    document.body.appendChild(a);
+    document.body.appendChild(b);
+
+    const sheetsA = a.shadowRoot?.adoptedStyleSheets ?? [];
+    const sheetsB = b.shadowRoot?.adoptedStyleSheets ?? [];
+
+    expect(sheetsA.length).toBeGreaterThan(0);
+    expect(sheetsB.length).toBeGreaterThan(0);
+    expect(sheetsA.at(-1)).toBe(sheetsB.at(-1));
+  });
+
+  it("does not inject a per-instance <style> when adoption succeeds", () => {
+    const player = document.createElement("hyperframes-player") as PlayerWithShadow;
+    document.body.appendChild(player);
+
+    expect(player.shadowRoot?.querySelector("style")).toBeNull();
+  });
+});
