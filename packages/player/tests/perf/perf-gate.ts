@@ -45,6 +45,7 @@ export type PerfBaseline = {
   scrubLatencyP95InlineMs: number;
   driftMaxMs: number;
   driftP95Ms: number;
+  paritySsimMin: number;
   allowedRegressionRatio: number;
 };
 

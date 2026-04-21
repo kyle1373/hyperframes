@@ -51,6 +51,9 @@ jobs:
           - shard: drift
             scenarios: drift
             runs: "3"
+          - shard: parity
+            scenarios: parity
+            runs: "3"
     steps:
       - uses: actions/checkout@v4
 
@@ -71,6 +74,18 @@ jobs:
         uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: stable
+
+      # The parity scenario shells out to `ffmpeg -lavfi ssim` to score the
+      # live-playback frame against the sync-seek reference frame. ffmpeg is
+      # not on the default ubuntu-latest runner image, and a missing binary
+      # surfaces as ENOENT inside computeSsim() — informative, but cheaper
+      # to just install it here so the shard never trips on infra.
+      - name: Install ffmpeg (parity shard only)
+        if: matrix.shard == 'parity'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -version | head -n 1
 
       - name: Run player perf — ${{ matrix.shard }} (measure mode)
         working-directory: packages/player

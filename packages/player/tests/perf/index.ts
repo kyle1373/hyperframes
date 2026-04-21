@@ -33,6 +33,7 @@ import { runFps } from "./scenarios/02-fps.ts";
 import { runLoad } from "./scenarios/03-load.ts";
 import { runScrub } from "./scenarios/04-scrub.ts";
 import { runDrift } from "./scenarios/05-drift.ts";
+import { runParity } from "./scenarios/06-parity.ts";
 import { reportAndGate, type GateMode, type GateResult, type Metric } from "./perf-gate.ts";
 import { launchBrowser } from "./runner.ts";
 import { startServer } from "./server.ts";
@@ -41,7 +42,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const RESULTS_DIR = resolve(HERE, "results");
 const RESULTS_FILE = resolve(RESULTS_DIR, "metrics.json");
 
-type ScenarioId = "load" | "fps" | "scrub" | "drift";
+type ScenarioId = "load" | "fps" | "scrub" | "drift" | "parity";
 
 /**
  * Per-scenario default `runs` value when the caller didn't pass `--runs`.
@@ -76,6 +77,7 @@ const DEFAULT_RUNS: Record<ScenarioId, number> = {
   fps: 3,
   scrub: 3,
   drift: 3,
+  parity: 3,
 };
 
 type ResultsFile = {
@@ -126,7 +128,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     // `mode` is consumed (measure logs regressions but never fails; enforce
     // exits non-zero on regression).
     mode: (process.env.PLAYER_PERF_MODE as GateMode) === "enforce" ? "enforce" : "measure",
-    scenarios: ["load", "fps", "scrub", "drift"],
+    scenarios: ["load", "fps", "scrub", "drift", "parity"],
     runs: null,
     fixture: null,
     headful: false,
@@ -213,6 +215,14 @@ async function main(): Promise<void> {
           browser,
           origin: server.origin,
           runs: args.runs ?? DEFAULT_RUNS.drift,
+          fixture: args.fixture,
+        });
+        metrics.push(...m);
+      } else if (scenario === "parity") {
+        const m = await runParity({
+          browser,
+          origin: server.origin,
+          runs: args.runs ?? DEFAULT_RUNS.parity,
           fixture: args.fixture,
         });
         metrics.push(...m);
