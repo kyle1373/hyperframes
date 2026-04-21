@@ -1246,575 +1246,365 @@ export async function executeRenderJob(
         createVideoFrameInjector(frameLookup),
         cfg,
       );
-      await initializeSession(domSession);
-      assertNotAborted();
-      lastBrowserConsole = domSession.browserConsoleBuffer;
-
-      // Set transparent background once for this dedicated DOM session.
-      // captureAlphaPng() per frame skips the per-frame CDP set/reset overhead.
-      await initTransparentBackground(domSession.page);
-
-      // ── Scene detection for shader transitions ──────────────────────────
-      // Query the browser for transition metadata written by @hyperframes/shader-transitions
-      // (window.__hf.transitions) and discover which elements belong to each scene.
-      const transitionMeta: HdrTransitionMeta[] = await domSession.page.evaluate(() => {
-        return window.__hf?.transitions ?? [];
-      });
-
-      // Contract: compositions using window.__hf.transitions must wrap each
-      // scene's elements in a <div class="scene" id="sceneName"> where the id
-      // matches the fromScene/toScene values declared in the transition metadata.
-      const sceneElements: Record<string, string[]> = await domSession.page.evaluate(() => {
-        const scenes = document.querySelectorAll(".scene");
-        const map: Record<string, string[]> = {};
-        for (const scene of scenes) {
-          const els = scene.querySelectorAll("[data-start]");
-          map[scene.id] = Array.from(els).map((e) => e.id);
-        }
-        return map;
-      });
-
-      const transitionRanges: TransitionRange[] = transitionMeta.map((t) => ({
-        ...t,
-        startFrame: Math.floor(t.time * job.config.fps),
-        endFrame: Math.ceil((t.time + t.duration) * job.config.fps),
-      }));
-
-      if (transitionRanges.length > 0) {
-        log.info("[Render] Detected shader transitions for HDR compositing", {
-          count: transitionRanges.length,
-          transitions: transitionRanges.map((t) => ({
-            shader: t.shader,
-            from: t.fromScene,
-            to: t.toScene,
-            frames: `${t.startFrame}-${t.endFrame}`,
-          })),
-        });
-      }
-
-      // Spawn HDR streaming encoder accepting raw rgb48le composited frames
-      const hdrEncoder = await spawnStreamingEncoder(
-        videoOnlyPath,
-        {
-          fps: job.config.fps,
-          width,
-          height,
-          codec: preset.codec,
-          preset: preset.preset,
-          quality: preset.quality,
-          pixelFormat: preset.pixelFormat,
-          hdr: preset.hdr,
-          rawInputFormat: "rgb48le",
-        },
-        abortSignal,
-        { ffmpegStreamingTimeout: 3_600_000 },
-      );
-      assertNotAborted();
-
-      // ── Query element bounds for HDR extraction dimensions ────────────
-      // Extract at each HDR video's display dimensions (not composition dimensions)
-      // so the source stride matches the blit dimensions. Elements that aren't
-      // visible at t=0 (e.g., data-start > 0) need to be queried at their own
-      // start time so their layout dimensions are available.
-      const hdrExtractionDims = new Map<string, { width: number; height: number }>();
-      // CSS `object-fit` / `object-position` for HDR <img> elements. Captured
-      // alongside `hdrExtractionDims` so the static-image decoder can resample
-      // the rgb48le buffer into the element's layout box the same way the
-      // browser would, instead of blitting the source PNG at native size.
-      const hdrImageFitInfo = new Map<string, { fit: string; position: string }>();
-      const hdrVideoStartTimes = new Map<string, number>();
-      for (const v of composition.videos) {
-        if (hdrVideoIds.includes(v.id)) {
-          hdrVideoStartTimes.set(v.id, v.start);
-        }
-      }
-      const hdrImageStartTimes = new Map<string, number>();
-      for (const img of composition.images) {
-        if (nativeHdrImageIds.has(img.id)) {
-          hdrImageStartTimes.set(img.id, img.start);
-        }
-      }
-
-      // Collect unique start times to minimize seek operations. Merge HDR
-      // video AND image start times so an HDR image with `data-start > 0`
-      // also gets a stacking-query pass at its appearance moment.
-      const uniqueStartTimes = [
-        ...new Set([...hdrVideoStartTimes.values(), ...hdrImageStartTimes.values()]),
-      ].sort((a, b) => a - b);
-      for (const seekTime of uniqueStartTimes) {
-        await domSession.page.evaluate((t: number) => {
-          if (window.__hf && typeof window.__hf.seek === "function") window.__hf.seek(t);
-        }, seekTime);
-        if (domSession.onBeforeCapture) {
-          await domSession.onBeforeCapture(domSession.page, seekTime);
-        }
-        const stacking = await queryElementStacking(domSession.page, nativeHdrIds);
-        for (const el of stacking) {
-          // Use layout dimensions (offsetWidth/offsetHeight) for extraction — these
-          // are unaffected by CSS transforms (GSAP scale/rotation). getBoundingClientRect
-          // returns the transformed bounding box which can be wrong for extraction.
-          if (
-            el.isHdr &&
-            el.layoutWidth > 0 &&
-            el.layoutHeight > 0 &&
-            !hdrExtractionDims.has(el.id)
-          ) {
-            hdrExtractionDims.set(el.id, { width: el.layoutWidth, height: el.layoutHeight });
-          }
-          // Record `object-fit` / `object-position` for HDR images so the
-          // static-image decode pass can resample to layout dimensions with
-          // the same semantics the browser would apply.
-          if (el.isHdr && nativeHdrImageIds.has(el.id) && !hdrImageFitInfo.has(el.id)) {
-            hdrImageFitInfo.set(el.id, {
-              fit: el.objectFit,
-              position: el.objectPosition,
-            });
-          }
-        }
-      }
-
-      // ── Pre-extract all HDR video frames in a single FFmpeg pass ──────
+      // Track lifecycle of resources spawned during HDR rendering so the
+      // outer finally block can defensively reclaim anything that wasn't
+      // cleaned up via the success path. Both closeCaptureSession and
+      // StreamingEncoder.close() are idempotent, but the flags let us avoid
+      // redundant work and make the intent explicit.
+      let hdrEncoder: StreamingEncoder | null = null;
+      let hdrEncoderClosed = false;
+      let domSessionClosed = false;
+      // Track HDR video frame directories at this scope so the outer finally
+      // can clear their entries from the module-scoped frameDirMaxIndexCache.
+      // Without this, the cache leaks one entry per HDR video per render.
       const hdrFrameDirs = new Map<string, string>();
-      for (const [videoId, srcPath] of hdrVideoSrcPaths) {
-        const video = composition.videos.find((v) => v.id === videoId);
-        if (!video) continue;
-        const frameDir = join(framesDir, `hdr_${videoId}`);
-        mkdirSync(frameDir, { recursive: true });
-        const duration = video.end - video.start;
-        const dims = hdrExtractionDims.get(videoId) ?? { width, height };
-        const ffmpegArgs = [
-          "-ss",
-          String(video.mediaStart),
-          "-i",
-          srcPath,
-          "-t",
-          String(duration),
-          "-r",
-          String(job.config.fps),
-          "-vf",
-          `scale=${dims.width}:${dims.height}:force_original_aspect_ratio=increase,crop=${dims.width}:${dims.height}`,
-          "-pix_fmt",
-          "rgb48le",
-          "-c:v",
-          "png",
-          "-y",
-          join(frameDir, "frame_%04d.png"),
-        ];
-        const result = await runFfmpeg(ffmpegArgs, { signal: abortSignal });
-        if (!result.success) {
-          hdrDiagnostics.videoExtractionFailures += 1;
-          log.error("HDR frame pre-extraction failed; aborting render", {
-            videoId,
-            srcPath,
-            stderr: result.stderr.slice(-400),
-          });
-          throw new Error(
-            `HDR frame extraction failed for video "${videoId}". ` +
-              `Aborting render to avoid shipping black HDR layers.`,
-          );
-        }
-        hdrFrameDirs.set(videoId, frameDir);
-      }
-
-      // ── Pre-decode all HDR image buffers once ────────────────────────
-      // Static images decode exactly once, then the resulting rgb48le buffer
-      // is blitted on every visible frame. Caching the decode here keeps the
-      // per-frame cost to a memcpy + blit. Failures are logged and skipped so
-      // a single broken file doesn't kill the render.
-      //
-      // We resample the decoded buffer to the element's *layout* dimensions
-      // here (using CSS `object-fit` / `object-position` semantics), so the
-      // affine blit downstream can treat the buffer as if the source was
-      // sized to the element's box. Without this step, an `<img>` element
-      // styled `object-fit: cover` would render its source PNG at native
-      // pixel size inside the layout box — visually a small image floating
-      // in the top-left corner of its container instead of filling it.
-      const hdrImageBuffers = new Map<string, HdrImageBuffer>();
-      for (const [imageId, srcPath] of hdrImageSrcPaths) {
-        try {
-          const decoded = decodePngToRgb48le(readFileSync(srcPath));
-          const layout = hdrExtractionDims.get(imageId);
-          const fitInfo = hdrImageFitInfo.get(imageId);
-          if (layout && (layout.width !== decoded.width || layout.height !== decoded.height)) {
-            const fit = normalizeObjectFit(fitInfo?.fit);
-            const resampled = resampleRgb48leObjectFit(
-              decoded.data,
-              decoded.width,
-              decoded.height,
-              layout.width,
-              layout.height,
-              fit,
-              fitInfo?.position,
-            );
-            hdrImageBuffers.set(imageId, {
-              data: resampled,
-              width: layout.width,
-              height: layout.height,
-            });
-          } else {
-            hdrImageBuffers.set(imageId, {
-              data: Buffer.from(decoded.data),
-              width: decoded.width,
-              height: decoded.height,
-            });
-          }
-        } catch (err) {
-          hdrDiagnostics.imageDecodeFailures += 1;
-          log.error("HDR image decode failed; aborting render", {
-            imageId,
-            srcPath,
-            error: err instanceof Error ? err.message : String(err),
-          });
-          throw new Error(
-            `HDR image decode failed for image "${imageId}". ` +
-              `Aborting render to avoid shipping missing HDR image layers.`,
-          );
-        }
-      }
-
-      assertNotAborted();
-
       try {
-        // The beforeCaptureHook injects SDR video frames into the DOM.
-        // We call it manually since the HDR loop doesn't use captureFrame().
-        const beforeCaptureHook = domSession.onBeforeCapture;
+        await initializeSession(domSession);
+        assertNotAborted();
+        lastBrowserConsole = domSession.browserConsoleBuffer;
 
-        // Track which HDR video frame directories have been cleaned up.
-        // Once a video's last frame has been used (time > video.end), its
-        // extraction directory is deleted to free disk space. This prevents
-        // disk exhaustion on compositions with many HDR videos.
-        const cleanedUpVideos = new Set<string>();
-        // Build a map of video end times for quick lookup
-        const hdrVideoEndTimes = new Map<string, number>();
+        // Set transparent background once for this dedicated DOM session.
+        // captureAlphaPng() per frame skips the per-frame CDP set/reset overhead.
+        await initTransparentBackground(domSession.page);
+
+        // ── Scene detection for shader transitions ──────────────────────────
+        // Query the browser for transition metadata written by @hyperframes/shader-transitions
+        // (window.__hf.transitions) and discover which elements belong to each scene.
+        const transitionMeta: HdrTransitionMeta[] = await domSession.page.evaluate(() => {
+          return window.__hf?.transitions ?? [];
+        });
+
+        // Contract: compositions using window.__hf.transitions must wrap each
+        // scene's elements in a <div class="scene" id="sceneName"> where the id
+        // matches the fromScene/toScene values declared in the transition metadata.
+        const sceneElements: Record<string, string[]> = await domSession.page.evaluate(() => {
+          const scenes = document.querySelectorAll(".scene");
+          const map: Record<string, string[]> = {};
+          for (const scene of scenes) {
+            const els = scene.querySelectorAll("[data-start]");
+            map[scene.id] = Array.from(els).map((e) => e.id);
+          }
+          return map;
+        });
+
+        const transitionRanges: TransitionRange[] = transitionMeta.map((t) => ({
+          ...t,
+          startFrame: Math.floor(t.time * job.config.fps),
+          endFrame: Math.ceil((t.time + t.duration) * job.config.fps),
+        }));
+
+        if (transitionRanges.length > 0) {
+          log.info("[Render] Detected shader transitions for HDR compositing", {
+            count: transitionRanges.length,
+            transitions: transitionRanges.map((t) => ({
+              shader: t.shader,
+              from: t.fromScene,
+              to: t.toScene,
+              frames: `${t.startFrame}-${t.endFrame}`,
+            })),
+          });
+        }
+
+        // Spawn HDR streaming encoder accepting raw rgb48le composited frames.
+        // Assigned to the let declared above so the outer finally can close it
+        // if any of the work between here and hdrEncoder.close() throws.
+        hdrEncoder = await spawnStreamingEncoder(
+          videoOnlyPath,
+          {
+            fps: job.config.fps,
+            width,
+            height,
+            codec: preset.codec,
+            preset: preset.preset,
+            quality: preset.quality,
+            pixelFormat: preset.pixelFormat,
+            hdr: preset.hdr,
+            rawInputFormat: "rgb48le",
+          },
+          abortSignal,
+          { ffmpegStreamingTimeout: 3_600_000 },
+        );
+        assertNotAborted();
+
+        // ── Query element bounds for HDR extraction dimensions ────────────
+        // Extract at each HDR video's display dimensions (not composition dimensions)
+        // so the source stride matches the blit dimensions. Elements that aren't
+        // visible at t=0 (e.g., data-start > 0) need to be queried at their own
+        // start time so their layout dimensions are available.
+        const hdrExtractionDims = new Map<string, { width: number; height: number }>();
+        // CSS `object-fit` / `object-position` for HDR <img> elements. Captured
+        // alongside `hdrExtractionDims` so the static-image decoder can resample
+        // the rgb48le buffer into the element's layout box the same way the
+        // browser would, instead of blitting the source PNG at native size.
+        const hdrImageFitInfo = new Map<string, { fit: string; position: string }>();
+        const hdrVideoStartTimes = new Map<string, number>();
         for (const v of composition.videos) {
-          if (hdrFrameDirs.has(v.id)) {
-            hdrVideoEndTimes.set(v.id, v.end);
+          if (hdrVideoIds.includes(v.id)) {
+            hdrVideoStartTimes.set(v.id, v.start);
+          }
+        }
+        const hdrImageStartTimes = new Map<string, number>();
+        for (const img of composition.images) {
+          if (nativeHdrImageIds.has(img.id)) {
+            hdrImageStartTimes.set(img.id, img.start);
           }
         }
 
-        // ── compositeToBuffer: layer compositing helper ────────────────────
-        // Extracted so the transition path can composite each scene independently.
-        // Closes over domSession, hdrFrameDirs, composition, nativeHdrVideoIds, etc.
-        //
-        // @param canvas       - Pre-allocated rgb48le buffer (width * height * 6 bytes)
-        // @param time         - Seek time in seconds
-        // @param fullStacking - Complete stacking info for ALL elements (used for hideIds)
-        // @param elementFilter - When set, only composite elements whose IDs are in this set.
-        //                        When undefined, all elements are included (non-transition frame).
-        // @param debugFrameIndex - Frame index used to label diagnostic dumps. -1 disables
-        //                        per-layer dumps even when KEEP_TEMP=1 (for warmup calls).
-        const debugDumpEnabled = process.env.KEEP_TEMP === "1";
-        const debugDumpDir = debugDumpEnabled ? join(framesDir, "debug-composite") : null;
-        if (debugDumpDir && !existsSync(debugDumpDir)) {
-          mkdirSync(debugDumpDir, { recursive: true });
-        }
-        function countNonZeroAlpha(rgba: Uint8Array): number {
-          let n = 0;
-          for (let p = 3; p < rgba.length; p += 4) {
-            if (rgba[p] !== 0) n++;
+        // Collect unique start times to minimize seek operations. Merge HDR
+        // video AND image start times so an HDR image with `data-start > 0`
+        // also gets a stacking-query pass at its appearance moment.
+        const uniqueStartTimes = [
+          ...new Set([...hdrVideoStartTimes.values(), ...hdrImageStartTimes.values()]),
+        ].sort((a, b) => a - b);
+        for (const seekTime of uniqueStartTimes) {
+          await domSession.page.evaluate((t: number) => {
+            if (window.__hf && typeof window.__hf.seek === "function") window.__hf.seek(t);
+          }, seekTime);
+          if (domSession.onBeforeCapture) {
+            await domSession.onBeforeCapture(domSession.page, seekTime);
           }
-          return n;
-        }
-        function countNonZeroRgb48(buf: Uint8Array): number {
-          let n = 0;
-          for (let p = 0; p < buf.length; p += 6) {
-            if (buf[p] !== 0 || buf[p + 1] !== 0 || buf[p + 2] !== 0) n++;
+          const stacking = await queryElementStacking(domSession.page, nativeHdrIds);
+          for (const el of stacking) {
+            // Use layout dimensions (offsetWidth/offsetHeight) for extraction — these
+            // are unaffected by CSS transforms (GSAP scale/rotation). getBoundingClientRect
+            // returns the transformed bounding box which can be wrong for extraction.
+            if (
+              el.isHdr &&
+              el.layoutWidth > 0 &&
+              el.layoutHeight > 0 &&
+              !hdrExtractionDims.has(el.id)
+            ) {
+              hdrExtractionDims.set(el.id, { width: el.layoutWidth, height: el.layoutHeight });
+            }
+            // Record `object-fit` / `object-position` for HDR images so the
+            // static-image decode pass can resample to layout dimensions with
+            // the same semantics the browser would apply.
+            if (el.isHdr && nativeHdrImageIds.has(el.id) && !hdrImageFitInfo.has(el.id)) {
+              hdrImageFitInfo.set(el.id, {
+                fit: el.objectFit,
+                position: el.objectPosition,
+              });
+            }
           }
-          return n;
         }
-        async function compositeToBuffer(
-          canvas: Buffer,
-          time: number,
-          fullStacking: ElementStackingInfo[],
-          elementFilter?: Set<string>,
-          debugFrameIndex: number = -1,
-        ): Promise<void> {
-          // Filter stacking info when rendering a single scene
-          const filteredStacking = elementFilter
-            ? fullStacking.filter((e) => elementFilter.has(e.id))
-            : fullStacking;
 
-          // Group filtered elements into z-ordered layers
-          const layers = groupIntoLayers(filteredStacking);
-
-          const shouldLog = debugDumpEnabled && debugFrameIndex >= 0;
-          if (shouldLog) {
-            log.info("[diag] compositeToBuffer plan", {
-              frame: debugFrameIndex,
-              time: time.toFixed(3),
-              filterSize: elementFilter?.size,
-              fullStackingCount: fullStacking.length,
-              filteredCount: filteredStacking.length,
-              layerCount: layers.length,
-              layers: layers.map((l) =>
-                l.type === "hdr"
-                  ? {
-                      type: "hdr",
-                      id: l.element.id,
-                      z: l.element.zIndex,
-                      visible: l.element.visible,
-                      opacity: l.element.opacity,
-                      bounds: `${Math.round(l.element.x)},${Math.round(l.element.y)} ${Math.round(l.element.width)}x${Math.round(l.element.height)}`,
-                    }
-                  : { type: "dom", ids: l.elementIds },
-              ),
+        // ── Pre-extract all HDR video frames in a single FFmpeg pass ──────
+        // hdrFrameDirs is declared above the try block so the outer finally
+        // can clear matching frameDirMaxIndexCache entries on any exit path.
+        for (const [videoId, srcPath] of hdrVideoSrcPaths) {
+          const video = composition.videos.find((v) => v.id === videoId);
+          if (!video) continue;
+          const frameDir = join(framesDir, `hdr_${videoId}`);
+          mkdirSync(frameDir, { recursive: true });
+          const duration = video.end - video.start;
+          const dims = hdrExtractionDims.get(videoId) ?? { width, height };
+          const ffmpegArgs = [
+            "-ss",
+            String(video.mediaStart),
+            "-i",
+            srcPath,
+            "-t",
+            String(duration),
+            "-r",
+            String(job.config.fps),
+            "-vf",
+            `scale=${dims.width}:${dims.height}:force_original_aspect_ratio=increase,crop=${dims.width}:${dims.height}`,
+            "-pix_fmt",
+            "rgb48le",
+            "-c:v",
+            "png",
+            "-y",
+            join(frameDir, "frame_%04d.png"),
+          ];
+          const result = await runFfmpeg(ffmpegArgs, { signal: abortSignal });
+          if (!result.success) {
+            hdrDiagnostics.videoExtractionFailures += 1;
+            log.error("HDR frame pre-extraction failed; aborting render", {
+              videoId,
+              srcPath,
+              stderr: result.stderr.slice(-400),
             });
+            throw new Error(
+              `HDR frame extraction failed for video "${videoId}". ` +
+                `Aborting render to avoid shipping black HDR layers.`,
+            );
           }
+          hdrFrameDirs.set(videoId, frameDir);
+        }
 
-          // Composite layers bottom-to-top
-          for (const [layerIdx, layer] of layers.entries()) {
-            if (layer.type === "hdr") {
-              const before = shouldLog ? countNonZeroRgb48(canvas) : 0;
-              const isHdrImage = nativeHdrImageIds.has(layer.element.id);
-              if (isHdrImage) {
-                blitHdrImageLayer(
-                  canvas,
-                  layer.element,
-                  hdrImageBuffers,
-                  width,
-                  height,
-                  log,
-                  imageTransfers.get(layer.element.id),
-                  effectiveHdr?.transfer,
-                );
-              } else {
-                blitHdrVideoLayer(
-                  canvas,
-                  layer.element,
-                  time,
-                  job.config.fps,
-                  hdrFrameDirs,
-                  hdrVideoStartTimes,
-                  width,
-                  height,
-                  log,
-                  videoTransfers.get(layer.element.id),
-                  effectiveHdr?.transfer,
-                );
-              }
-              if (shouldLog) {
-                const after = countNonZeroRgb48(canvas);
-                if (isHdrImage) {
-                  const buf = hdrImageBuffers.get(layer.element.id);
-                  log.info("[diag] hdr layer blit", {
-                    frame: debugFrameIndex,
-                    layerIdx,
-                    id: layer.element.id,
-                    kind: "image",
-                    pixelsAdded: after - before,
-                    totalNonZero: after,
-                    bufferDecoded: !!buf,
-                    bufferDims: buf ? `${buf.width}x${buf.height}` : null,
-                  });
-                } else {
-                  const frameDir = hdrFrameDirs.get(layer.element.id);
-                  const startTime = hdrVideoStartTimes.get(layer.element.id) ?? 0;
-                  const localTime = time - startTime;
-                  const frameNum = Math.floor(localTime * job.config.fps) + 1;
-                  const expectedFrame = frameDir
-                    ? join(frameDir, `frame_${String(frameNum).padStart(4, "0")}.png`)
-                    : null;
-                  log.info("[diag] hdr layer blit", {
-                    frame: debugFrameIndex,
-                    layerIdx,
-                    id: layer.element.id,
-                    kind: "video",
-                    pixelsAdded: after - before,
-                    totalNonZero: after,
-                    startTime,
-                    localTime: localTime.toFixed(3),
-                    hdrFrameNum: frameNum,
-                    expectedFrame,
-                    expectedFrameExists: expectedFrame ? existsSync(expectedFrame) : false,
-                  });
-                }
-              }
+        // ── Pre-decode all HDR image buffers once ────────────────────────
+        // Static images decode exactly once, then the resulting rgb48le buffer
+        // is blitted on every visible frame. Caching the decode here keeps the
+        // per-frame cost to a memcpy + blit. Failures are logged and skipped so
+        // a single broken file doesn't kill the render.
+        //
+        // We resample the decoded buffer to the element's *layout* dimensions
+        // here (using CSS `object-fit` / `object-position` semantics), so the
+        // affine blit downstream can treat the buffer as if the source was
+        // sized to the element's box. Without this step, an `<img>` element
+        // styled `object-fit: cover` would render its source PNG at native
+        // pixel size inside the layout box — visually a small image floating
+        // in the top-left corner of its container instead of filling it.
+        const hdrImageBuffers = new Map<string, HdrImageBuffer>();
+        for (const [imageId, srcPath] of hdrImageSrcPaths) {
+          try {
+            const decoded = decodePngToRgb48le(readFileSync(srcPath));
+            const layout = hdrExtractionDims.get(imageId);
+            const fitInfo = hdrImageFitInfo.get(imageId);
+            if (layout && (layout.width !== decoded.width || layout.height !== decoded.height)) {
+              const fit = normalizeObjectFit(fitInfo?.fit);
+              const resampled = resampleRgb48leObjectFit(
+                decoded.data,
+                decoded.width,
+                decoded.height,
+                layout.width,
+                layout.height,
+                fit,
+                fitInfo?.position,
+              );
+              hdrImageBuffers.set(imageId, {
+                data: resampled,
+                width: layout.width,
+                height: layout.height,
+              });
             } else {
-              // DOM layer: capture only elements in this layer.
-              //
-              // Each layer gets a fresh seek + inject cycle to guarantee correct
-              // visibility state — avoids fragile interactions between the frame
-              // injector, applyDomLayerMask, removeDomLayerMask, and GSAP re-seek.
-              //
-              // The mask:
-              //   - mass-hides every body descendant via stylesheet
-              //   - re-shows the layer's elements (and their descendants and
-              //     their injected `__render_frame_*` siblings) so deep-nested
-              //     content stays visible even though intermediate ancestors
-              //     are hidden
-              //   - inline-hides every other data-start element so they don't
-              //     paint when they happen to be descendants of a layer element
-              //     (most importantly: HDR videos and other-layer SDR videos
-              //     that live inside `#root` when capturing the root DOM layer)
-              //
-              // Without the mask, every DOM screenshot captures the full page
-              // (root background, sibling scenes' static content, the painted
-              // border/box-shadow of cards, etc.) and the resulting opaque
-              // pixels overwrite previously composited HDR content beneath.
-              const allElementIds = fullStacking.map((e) => e.id);
-              const layerIds = new Set(layer.elementIds);
-              const hideIds = allElementIds.filter((id) => !layerIds.has(id));
+              hdrImageBuffers.set(imageId, {
+                data: Buffer.from(decoded.data),
+                width: decoded.width,
+                height: decoded.height,
+              });
+            }
+          } catch (err) {
+            hdrDiagnostics.imageDecodeFailures += 1;
+            log.error("HDR image decode failed; aborting render", {
+              imageId,
+              srcPath,
+              error: err instanceof Error ? err.message : String(err),
+            });
+            throw new Error(
+              `HDR image decode failed for image "${imageId}". ` +
+                `Aborting render to avoid shipping missing HDR image layers.`,
+            );
+          }
+        }
 
-              // 1. Seek GSAP to restore all animated properties from clean state
-              await domSession.page.evaluate((t: number) => {
-                if (window.__hf && typeof window.__hf.seek === "function") window.__hf.seek(t);
-              }, time);
+        assertNotAborted();
 
-              // 2. Run frame injector to set correct SDR video visibility
-              if (beforeCaptureHook) {
-                await beforeCaptureHook(domSession.page, time);
-              }
+        try {
+          // The beforeCaptureHook injects SDR video frames into the DOM.
+          // We call it manually since the HDR loop doesn't use captureFrame().
+          const beforeCaptureHook = domSession.onBeforeCapture;
 
-              // 3. Install the mask (mass-hide stylesheet + inline-hide non-layer ids)
-              await applyDomLayerMask(domSession.page, layer.elementIds, hideIds);
-
-              // 4. Screenshot
-              const domPng = await captureAlphaPng(domSession.page, width, height);
-
-              // 5. Tear down the mask
-              await removeDomLayerMask(domSession.page, hideIds);
-
-              try {
-                const { data: domRgba } = decodePng(domPng);
-                // Invariant: this branch is only reached when HDR output is active.
-                if (!effectiveHdr) {
-                  throw new Error(
-                    "Invariant violation: effectiveHdr is undefined inside HDR layer branch",
-                  );
-                }
-                const before = shouldLog ? countNonZeroRgb48(canvas) : 0;
-                const alphaPixels = shouldLog ? countNonZeroAlpha(domRgba) : 0;
-                blitRgba8OverRgb48le(domRgba, canvas, width, height, effectiveHdr.transfer);
-                if (shouldLog && debugDumpDir) {
-                  const after = countNonZeroRgb48(canvas);
-                  const dumpName = `frame_${String(debugFrameIndex).padStart(4, "0")}_layer_${String(layerIdx).padStart(2, "0")}_dom.png`;
-                  const dumpPath = join(debugDumpDir, dumpName);
-                  writeFileSync(dumpPath, domPng);
-                  log.info("[diag] dom layer blit", {
-                    frame: debugFrameIndex,
-                    layerIdx,
-                    layerIds: layer.elementIds,
-                    hideCount: hideIds.length,
-                    pngBytes: domPng.length,
-                    alphaPixels,
-                    pixelsAdded: after - before,
-                    totalNonZero: after,
-                    dumpPath,
-                  });
-                }
-              } catch (err) {
-                log.warn("DOM layer decode/blit failed; skipping overlay", {
-                  layerIds: layer.elementIds,
-                  error: err instanceof Error ? err.message : String(err),
-                });
-              }
+          // Track which HDR video frame directories have been cleaned up.
+          // Once a video's last frame has been used (time > video.end), its
+          // extraction directory is deleted to free disk space. This prevents
+          // disk exhaustion on compositions with many HDR videos.
+          const cleanedUpVideos = new Set<string>();
+          // Build a map of video end times for quick lookup
+          const hdrVideoEndTimes = new Map<string, number>();
+          for (const v of composition.videos) {
+            if (hdrFrameDirs.has(v.id)) {
+              hdrVideoEndTimes.set(v.id, v.end);
             }
           }
 
-          if (shouldLog && debugDumpDir) {
-            const finalNonZero = countNonZeroRgb48(canvas);
-            log.info("[diag] compositeToBuffer end", {
-              frame: debugFrameIndex,
-              finalNonZeroPixels: finalNonZero,
-              totalPixels: width * height,
-              coverage: ((finalNonZero / (width * height)) * 100).toFixed(1) + "%",
-            });
+          // ── compositeToBuffer: layer compositing helper ────────────────────
+          // Extracted so the transition path can composite each scene independently.
+          // Closes over domSession, hdrFrameDirs, composition, nativeHdrVideoIds, etc.
+          //
+          // @param canvas       - Pre-allocated rgb48le buffer (width * height * 6 bytes)
+          // @param time         - Seek time in seconds
+          // @param fullStacking - Complete stacking info for ALL elements (used for hideIds)
+          // @param elementFilter - When set, only composite elements whose IDs are in this set.
+          //                        When undefined, all elements are included (non-transition frame).
+          // @param debugFrameIndex - Frame index used to label diagnostic dumps. -1 disables
+          //                        per-layer dumps even when KEEP_TEMP=1 (for warmup calls).
+          const debugDumpEnabled = process.env.KEEP_TEMP === "1";
+          const debugDumpDir = debugDumpEnabled ? join(framesDir, "debug-composite") : null;
+          if (debugDumpDir && !existsSync(debugDumpDir)) {
+            mkdirSync(debugDumpDir, { recursive: true });
           }
-        }
-
-        // ── Pre-allocate transition buffers ─────────────────────────────────
-        // Each buffer is width * height * 6 bytes (~37 MB at 1080p). Reused
-        // across frames to avoid per-frame allocation in the hot loop.
-        const bufSize = width * height * 6;
-        const hasTransitions = transitionRanges.length > 0;
-        const transBufferA = hasTransitions ? Buffer.alloc(bufSize) : null;
-        const transBufferB = hasTransitions ? Buffer.alloc(bufSize) : null;
-        const transOutput = hasTransitions ? Buffer.alloc(bufSize) : null;
-        // Pre-allocate the normal-frame canvas too — reused via .fill(0) each iteration
-        // to avoid ~37 MB allocation per frame in the hot loop.
-        const normalCanvas = Buffer.alloc(bufSize);
-
-        for (let i = 0; i < totalFrames; i++) {
-          assertNotAborted();
-          const time = i / job.config.fps;
-
-          // Seek timeline
-          await domSession.page.evaluate((t: number) => {
-            if (window.__hf && typeof window.__hf.seek === "function") window.__hf.seek(t);
-          }, time);
-
-          // Inject SDR video frames into the DOM
-          if (beforeCaptureHook) {
-            await beforeCaptureHook(domSession.page, time);
+          function countNonZeroAlpha(rgba: Uint8Array): number {
+            let n = 0;
+            for (let p = 3; p < rgba.length; p += 4) {
+              if (rgba[p] !== 0) n++;
+            }
+            return n;
           }
-
-          // Query ALL timed elements for z-order analysis
-          const stackingInfo = await queryElementStacking(domSession.page, nativeHdrIds);
-
-          // Find active transition for this frame (if any)
-          const activeTransition = transitionRanges.find(
-            (t) => i >= t.startFrame && i <= t.endFrame,
-          );
-
-          if (i % 30 === 0) {
-            const hdrEl = stackingInfo.find((e) => e.isHdr);
-            log.debug("[Render] HDR layer composite frame", {
-              frame: i,
-              time: time.toFixed(2),
-              hdrElement: hdrEl
-                ? { z: hdrEl.zIndex, visible: hdrEl.visible, width: hdrEl.width }
-                : null,
-              stackingCount: stackingInfo.length,
-              activeTransition: activeTransition?.shader,
-            });
+          function countNonZeroRgb48(buf: Uint8Array): number {
+            let n = 0;
+            for (let p = 0; p < buf.length; p += 6) {
+              if (
+                buf[p] !== 0 ||
+                buf[p + 1] !== 0 ||
+                buf[p + 2] !== 0 ||
+                buf[p + 3] !== 0 ||
+                buf[p + 4] !== 0 ||
+                buf[p + 5] !== 0
+              )
+                n++;
+            }
+            return n;
           }
+          async function compositeToBuffer(
+            canvas: Buffer,
+            time: number,
+            fullStacking: ElementStackingInfo[],
+            elementFilter?: Set<string>,
+            debugFrameIndex: number = -1,
+          ): Promise<void> {
+            // Filter stacking info when rendering a single scene
+            const filteredStacking = elementFilter
+              ? fullStacking.filter((e) => elementFilter.has(e.id))
+              : fullStacking;
 
-          if (activeTransition && transBufferA && transBufferB && transOutput) {
-            // ── Transition frame: dual-scene compositing ──────────────────
-            const progress =
-              activeTransition.endFrame === activeTransition.startFrame
-                ? 1
-                : (i - activeTransition.startFrame) /
-                  (activeTransition.endFrame - activeTransition.startFrame);
+            // Group filtered elements into z-ordered layers
+            const layers = groupIntoLayers(filteredStacking);
 
-            // Resolve scene element IDs
-            const sceneAIds = new Set(sceneElements[activeTransition.fromScene] ?? []);
-            const sceneBIds = new Set(sceneElements[activeTransition.toScene] ?? []);
+            const shouldLog = debugDumpEnabled && debugFrameIndex >= 0;
+            if (shouldLog) {
+              log.info("[diag] compositeToBuffer plan", {
+                frame: debugFrameIndex,
+                time: time.toFixed(3),
+                filterSize: elementFilter?.size,
+                fullStackingCount: fullStacking.length,
+                filteredCount: filteredStacking.length,
+                layerCount: layers.length,
+                layers: layers.map((l) =>
+                  l.type === "hdr"
+                    ? {
+                        type: "hdr",
+                        id: l.element.id,
+                        z: l.element.zIndex,
+                        visible: l.element.visible,
+                        opacity: l.element.opacity,
+                        bounds: `${Math.round(l.element.x)},${Math.round(l.element.y)} ${Math.round(l.element.width)}x${Math.round(l.element.height)}`,
+                      }
+                    : { type: "dom", ids: l.elementIds },
+                ),
+              });
+            }
 
-            // Zero-fill scene buffers (transition function writes every output pixel)
-            transBufferA.fill(0);
-            transBufferB.fill(0);
-
-            for (const [sceneBuf, sceneIds] of [
-              [transBufferA, sceneAIds],
-              [transBufferB, sceneBIds],
-            ] as const) {
-              // Fresh state: seek + inject
-              await domSession.page.evaluate((t: number) => {
-                if (window.__hf && typeof window.__hf.seek === "function") window.__hf.seek(t);
-              }, time);
-              if (beforeCaptureHook) {
-                await beforeCaptureHook(domSession.page, time);
-              }
-
-              // Blit all HDR videos/images for this scene
-              for (const el of stackingInfo) {
-                if (!el.isHdr || !sceneIds.has(el.id)) continue;
-                if (nativeHdrImageIds.has(el.id)) {
+            // Composite layers bottom-to-top
+            for (const [layerIdx, layer] of layers.entries()) {
+              if (layer.type === "hdr") {
+                const before = shouldLog ? countNonZeroRgb48(canvas) : 0;
+                const isHdrImage = nativeHdrImageIds.has(layer.element.id);
+                if (isHdrImage) {
                   blitHdrImageLayer(
-                    sceneBuf as Buffer,
-                    el,
+                    canvas,
+                    layer.element,
                     hdrImageBuffers,
                     width,
                     height,
                     log,
-                    imageTransfers.get(el.id),
+                    imageTransfers.get(layer.element.id),
                     effectiveHdr?.transfer,
                   );
                 } else {
                   blitHdrVideoLayer(
-                    sceneBuf as Buffer,
-                    el,
+                    canvas,
+                    layer.element,
                     time,
                     job.config.fps,
                     hdrFrameDirs,
@@ -1822,134 +1612,417 @@ export async function executeRenderJob(
                     width,
                     height,
                     log,
-                    videoTransfers.get(el.id),
+                    videoTransfers.get(layer.element.id),
                     effectiveHdr?.transfer,
                   );
                 }
-              }
-
-              // Single DOM screenshot: mask the page so only this scene's DOM
-              // elements paint. Same masking strategy as the per-layer DOM
-              // branch — see applyDomLayerMask for details. Native HDR videos
-              // and images are always inline-hidden so their fallback poster /
-              // SDR thumbnail doesn't bleed into the DOM overlay (HDR pixels
-              // are blitted separately by blitHdrVideoLayer / blitHdrImageLayer
-              // above).
-              const showIds = Array.from(sceneIds);
-              const hideIds = stackingInfo
-                .map((e) => e.id)
-                .filter((id) => !sceneIds.has(id) || nativeHdrIds.has(id));
-              await applyDomLayerMask(domSession.page, showIds, hideIds);
-              const domPng = await captureAlphaPng(domSession.page, width, height);
-              await removeDomLayerMask(domSession.page, hideIds);
-
-              try {
-                const { data: domRgba } = decodePng(domPng);
-                // Invariant: `hasHdrVideo` requires `effectiveHdr` to be set (see line ~919).
-                if (!effectiveHdr) {
-                  throw new Error(
-                    "Invariant violation: effectiveHdr is undefined inside hasHdrVideo branch",
-                  );
-                }
-                blitRgba8OverRgb48le(
-                  domRgba,
-                  sceneBuf as Buffer,
-                  width,
-                  height,
-                  effectiveHdr.transfer,
-                );
-              } catch (err) {
-                log.warn("DOM layer decode/blit failed; skipping overlay for transition scene", {
-                  frameIndex: i,
-                  sceneIds: Array.from(sceneIds),
-                  error: err instanceof Error ? err.message : String(err),
-                });
-              }
-            }
-
-            // Apply shader transition blend directly in PQ/HLG signal space.
-            // Linearization was attempted but destroys dark PQ content — values below
-            // PQ ~5000 quantize to zero in 16-bit linear, wiping out the bottom portion
-            // of dark video content. PQ space is perceptual and works well enough
-            // for shader math since the shaders were designed for perceptual (sRGB) space.
-            const transitionFn: TransitionFn = TRANSITIONS[activeTransition.shader] ?? crossfade;
-            transitionFn(transBufferA, transBufferB, transOutput, width, height, progress);
-
-            hdrEncoder.writeFrame(transOutput);
-          } else {
-            // ── Normal frame: full layer composite (no transition) ─────────
-            normalCanvas.fill(0);
-            await compositeToBuffer(normalCanvas, time, stackingInfo, undefined, i);
-            if (debugDumpEnabled && debugDumpDir && i % 30 === 0) {
-              const previewPath = join(
-                debugDumpDir,
-                `frame_${String(i).padStart(4, "0")}_final_rgb48le.bin`,
-              );
-              writeFileSync(previewPath, normalCanvas);
-            }
-            hdrEncoder.writeFrame(normalCanvas);
-          }
-
-          // Clean up HDR frame directories for videos that have ended.
-          // Frees disk space during long renders with many HDR videos.
-          // Skip when KEEP_TEMP=1 so we can inspect intermediate state.
-          if (process.env.KEEP_TEMP !== "1") {
-            for (const [videoId, endTime] of hdrVideoEndTimes) {
-              if (time > endTime && !cleanedUpVideos.has(videoId)) {
-                // Also check no active transition references this video's scene
-                const stillNeeded =
-                  activeTransition &&
-                  (sceneElements[activeTransition.fromScene]?.includes(videoId) ||
-                    sceneElements[activeTransition.toScene]?.includes(videoId));
-                if (!stillNeeded) {
-                  const frameDir = hdrFrameDirs.get(videoId);
-                  if (frameDir) {
-                    try {
-                      rmSync(frameDir, { recursive: true, force: true });
-                    } catch (err) {
-                      log.warn("Failed to clean up HDR frame directory", {
-                        videoId,
-                        frameDir,
-                        error: err instanceof Error ? err.message : String(err),
-                      });
-                    }
+                if (shouldLog) {
+                  const after = countNonZeroRgb48(canvas);
+                  if (isHdrImage) {
+                    const buf = hdrImageBuffers.get(layer.element.id);
+                    log.info("[diag] hdr layer blit", {
+                      frame: debugFrameIndex,
+                      layerIdx,
+                      id: layer.element.id,
+                      kind: "image",
+                      pixelsAdded: after - before,
+                      totalNonZero: after,
+                      bufferDecoded: !!buf,
+                      bufferDims: buf ? `${buf.width}x${buf.height}` : null,
+                    });
+                  } else {
+                    const frameDir = hdrFrameDirs.get(layer.element.id);
+                    const startTime = hdrVideoStartTimes.get(layer.element.id) ?? 0;
+                    const localTime = time - startTime;
+                    const frameNum = Math.floor(localTime * job.config.fps) + 1;
+                    const expectedFrame = frameDir
+                      ? join(frameDir, `frame_${String(frameNum).padStart(4, "0")}.png`)
+                      : null;
+                    log.info("[diag] hdr layer blit", {
+                      frame: debugFrameIndex,
+                      layerIdx,
+                      id: layer.element.id,
+                      kind: "video",
+                      pixelsAdded: after - before,
+                      totalNonZero: after,
+                      startTime,
+                      localTime: localTime.toFixed(3),
+                      hdrFrameNum: frameNum,
+                      expectedFrame,
+                      expectedFrameExists: expectedFrame ? existsSync(expectedFrame) : false,
+                    });
                   }
-                  cleanedUpVideos.add(videoId);
+                }
+              } else {
+                // DOM layer: capture only elements in this layer.
+                //
+                // Each layer gets a fresh seek + inject cycle to guarantee correct
+                // visibility state — avoids fragile interactions between the frame
+                // injector, applyDomLayerMask, removeDomLayerMask, and GSAP re-seek.
+                //
+                // The mask:
+                //   - mass-hides every body descendant via stylesheet
+                //   - re-shows the layer's elements (and their descendants and
+                //     their injected `__render_frame_*` siblings) so deep-nested
+                //     content stays visible even though intermediate ancestors
+                //     are hidden
+                //   - inline-hides every other data-start element so they don't
+                //     paint when they happen to be descendants of a layer element
+                //     (most importantly: HDR videos and other-layer SDR videos
+                //     that live inside `#root` when capturing the root DOM layer)
+                //
+                // Without the mask, every DOM screenshot captures the full page
+                // (root background, sibling scenes' static content, the painted
+                // border/box-shadow of cards, etc.) and the resulting opaque
+                // pixels overwrite previously composited HDR content beneath.
+                const allElementIds = fullStacking.map((e) => e.id);
+                const layerIds = new Set(layer.elementIds);
+                const hideIds = allElementIds.filter((id) => !layerIds.has(id));
+
+                // 1. Seek GSAP to restore all animated properties from clean state
+                await domSession.page.evaluate((t: number) => {
+                  if (window.__hf && typeof window.__hf.seek === "function") window.__hf.seek(t);
+                }, time);
+
+                // 2. Run frame injector to set correct SDR video visibility
+                if (beforeCaptureHook) {
+                  await beforeCaptureHook(domSession.page, time);
+                }
+
+                // 3. Install the mask (mass-hide stylesheet + inline-hide non-layer ids)
+                await applyDomLayerMask(domSession.page, layer.elementIds, hideIds);
+
+                // 4. Screenshot
+                const domPng = await captureAlphaPng(domSession.page, width, height);
+
+                // 5. Tear down the mask
+                await removeDomLayerMask(domSession.page, hideIds);
+
+                try {
+                  const { data: domRgba } = decodePng(domPng);
+                  // Invariant: this branch is only reached when HDR output is active.
+                  if (!effectiveHdr) {
+                    throw new Error(
+                      "Invariant violation: effectiveHdr is undefined inside HDR layer branch",
+                    );
+                  }
+                  const before = shouldLog ? countNonZeroRgb48(canvas) : 0;
+                  const alphaPixels = shouldLog ? countNonZeroAlpha(domRgba) : 0;
+                  blitRgba8OverRgb48le(domRgba, canvas, width, height, effectiveHdr.transfer);
+                  if (shouldLog && debugDumpDir) {
+                    const after = countNonZeroRgb48(canvas);
+                    const dumpName = `frame_${String(debugFrameIndex).padStart(4, "0")}_layer_${String(layerIdx).padStart(2, "0")}_dom.png`;
+                    const dumpPath = join(debugDumpDir, dumpName);
+                    writeFileSync(dumpPath, domPng);
+                    log.info("[diag] dom layer blit", {
+                      frame: debugFrameIndex,
+                      layerIdx,
+                      layerIds: layer.elementIds,
+                      hideCount: hideIds.length,
+                      pngBytes: domPng.length,
+                      alphaPixels,
+                      pixelsAdded: after - before,
+                      totalNonZero: after,
+                      dumpPath,
+                    });
+                  }
+                } catch (err) {
+                  log.warn("DOM layer decode/blit failed; skipping overlay", {
+                    layerIds: layer.elementIds,
+                    error: err instanceof Error ? err.message : String(err),
+                  });
                 }
               }
             }
+
+            if (shouldLog && debugDumpDir) {
+              const finalNonZero = countNonZeroRgb48(canvas);
+              log.info("[diag] compositeToBuffer end", {
+                frame: debugFrameIndex,
+                finalNonZeroPixels: finalNonZero,
+                totalPixels: width * height,
+                coverage: ((finalNonZero / (width * height)) * 100).toFixed(1) + "%",
+              });
+            }
           }
 
-          job.framesRendered = i + 1;
-          if ((i + 1) % 10 === 0 || i + 1 === totalFrames) {
-            const frameProgress = (i + 1) / totalFrames;
-            updateJobStatus(
-              job,
-              "rendering",
-              `HDR composite frame ${i + 1}/${job.totalFrames}`,
-              Math.round(25 + frameProgress * 55),
-              onProgress,
+          // ── Pre-allocate transition buffers ─────────────────────────────────
+          // Each buffer is width * height * 6 bytes (~37 MB at 1080p). Reused
+          // across frames to avoid per-frame allocation in the hot loop.
+          const bufSize = width * height * 6;
+          const hasTransitions = transitionRanges.length > 0;
+          const transBufferA = hasTransitions ? Buffer.alloc(bufSize) : null;
+          const transBufferB = hasTransitions ? Buffer.alloc(bufSize) : null;
+          const transOutput = hasTransitions ? Buffer.alloc(bufSize) : null;
+          // Pre-allocate the normal-frame canvas too — reused via .fill(0) each iteration
+          // to avoid ~37 MB allocation per frame in the hot loop.
+          const normalCanvas = Buffer.alloc(bufSize);
+
+          for (let i = 0; i < totalFrames; i++) {
+            assertNotAborted();
+            const time = i / job.config.fps;
+
+            // Seek timeline
+            await domSession.page.evaluate((t: number) => {
+              if (window.__hf && typeof window.__hf.seek === "function") window.__hf.seek(t);
+            }, time);
+
+            // Inject SDR video frames into the DOM
+            if (beforeCaptureHook) {
+              await beforeCaptureHook(domSession.page, time);
+            }
+
+            // Query ALL timed elements for z-order analysis
+            const stackingInfo = await queryElementStacking(domSession.page, nativeHdrIds);
+
+            // Find active transition for this frame (if any)
+            const activeTransition = transitionRanges.find(
+              (t) => i >= t.startFrame && i <= t.endFrame,
             );
+
+            if (i % 30 === 0) {
+              const hdrEl = stackingInfo.find((e) => e.isHdr);
+              log.debug("[Render] HDR layer composite frame", {
+                frame: i,
+                time: time.toFixed(2),
+                hdrElement: hdrEl
+                  ? { z: hdrEl.zIndex, visible: hdrEl.visible, width: hdrEl.width }
+                  : null,
+                stackingCount: stackingInfo.length,
+                activeTransition: activeTransition?.shader,
+              });
+            }
+
+            if (activeTransition && transBufferA && transBufferB && transOutput) {
+              // ── Transition frame: dual-scene compositing ──────────────────
+              const progress =
+                activeTransition.endFrame === activeTransition.startFrame
+                  ? 1
+                  : (i - activeTransition.startFrame) /
+                    (activeTransition.endFrame - activeTransition.startFrame);
+
+              // Resolve scene element IDs
+              const sceneAIds = new Set(sceneElements[activeTransition.fromScene] ?? []);
+              const sceneBIds = new Set(sceneElements[activeTransition.toScene] ?? []);
+
+              // Zero-fill scene buffers (transition function writes every output pixel)
+              transBufferA.fill(0);
+              transBufferB.fill(0);
+
+              for (const [sceneBuf, sceneIds] of [
+                [transBufferA, sceneAIds],
+                [transBufferB, sceneBIds],
+              ] as const) {
+                // Re-check abort between scene A and scene B. Each scene
+                // capture below performs a DOM seek, optional hook,
+                // per-layer HDR blits, and a full-page screenshot — easily
+                // hundreds of ms. Without this, an abort that arrives
+                // during scene A's capture won't fire until the next outer
+                // frame, after scene B has already been fully composited
+                // and discarded.
+                assertNotAborted();
+                // Fresh state: seek + inject
+                await domSession.page.evaluate((t: number) => {
+                  if (window.__hf && typeof window.__hf.seek === "function") window.__hf.seek(t);
+                }, time);
+                if (beforeCaptureHook) {
+                  await beforeCaptureHook(domSession.page, time);
+                }
+
+                // Blit all HDR videos/images for this scene
+                for (const el of stackingInfo) {
+                  if (!el.isHdr || !sceneIds.has(el.id)) continue;
+                  if (nativeHdrImageIds.has(el.id)) {
+                    blitHdrImageLayer(
+                      sceneBuf as Buffer,
+                      el,
+                      hdrImageBuffers,
+                      width,
+                      height,
+                      log,
+                      imageTransfers.get(el.id),
+                      effectiveHdr?.transfer,
+                    );
+                  } else {
+                    blitHdrVideoLayer(
+                      sceneBuf as Buffer,
+                      el,
+                      time,
+                      job.config.fps,
+                      hdrFrameDirs,
+                      hdrVideoStartTimes,
+                      width,
+                      height,
+                      log,
+                      videoTransfers.get(el.id),
+                      effectiveHdr?.transfer,
+                    );
+                  }
+                }
+
+                // Single DOM screenshot: mask the page so only this scene's DOM
+                // elements paint. Same masking strategy as the per-layer DOM
+                // branch — see applyDomLayerMask for details. Native HDR videos
+                // and images are always inline-hidden so their fallback poster /
+                // SDR thumbnail doesn't bleed into the DOM overlay (HDR pixels
+                // are blitted separately by blitHdrVideoLayer / blitHdrImageLayer
+                // above).
+                const showIds = Array.from(sceneIds);
+                const hideIds = stackingInfo
+                  .map((e) => e.id)
+                  .filter((id) => !sceneIds.has(id) || nativeHdrIds.has(id));
+                await applyDomLayerMask(domSession.page, showIds, hideIds);
+                const domPng = await captureAlphaPng(domSession.page, width, height);
+                await removeDomLayerMask(domSession.page, hideIds);
+
+                try {
+                  const { data: domRgba } = decodePng(domPng);
+                  // Invariant: `hasHdrVideo` requires `effectiveHdr` to be set (see line ~919).
+                  if (!effectiveHdr) {
+                    throw new Error(
+                      "Invariant violation: effectiveHdr is undefined inside hasHdrVideo branch",
+                    );
+                  }
+                  blitRgba8OverRgb48le(
+                    domRgba,
+                    sceneBuf as Buffer,
+                    width,
+                    height,
+                    effectiveHdr.transfer,
+                  );
+                } catch (err) {
+                  log.warn("DOM layer decode/blit failed; skipping overlay for transition scene", {
+                    frameIndex: i,
+                    sceneIds: Array.from(sceneIds),
+                    error: err instanceof Error ? err.message : String(err),
+                  });
+                }
+              }
+
+              // Apply shader transition blend directly in PQ/HLG signal space.
+              // Linearization was attempted but destroys dark PQ content — values below
+              // PQ ~5000 quantize to zero in 16-bit linear, wiping out the bottom portion
+              // of dark video content. PQ space is perceptual and works well enough
+              // for shader math since the shaders were designed for perceptual (sRGB) space.
+              const transitionFn: TransitionFn = TRANSITIONS[activeTransition.shader] ?? crossfade;
+              transitionFn(transBufferA, transBufferB, transOutput, width, height, progress);
+
+              hdrEncoder.writeFrame(transOutput);
+            } else {
+              // ── Normal frame: full layer composite (no transition) ─────────
+              normalCanvas.fill(0);
+              await compositeToBuffer(normalCanvas, time, stackingInfo, undefined, i);
+              if (debugDumpEnabled && debugDumpDir && i % 30 === 0) {
+                const previewPath = join(
+                  debugDumpDir,
+                  `frame_${String(i).padStart(4, "0")}_final_rgb48le.bin`,
+                );
+                writeFileSync(previewPath, normalCanvas);
+              }
+              hdrEncoder.writeFrame(normalCanvas);
+            }
+
+            // Clean up HDR frame directories for videos that have ended.
+            // Frees disk space during long renders with many HDR videos.
+            // Skip when KEEP_TEMP=1 so we can inspect intermediate state.
+            if (process.env.KEEP_TEMP !== "1") {
+              for (const [videoId, endTime] of hdrVideoEndTimes) {
+                if (time > endTime && !cleanedUpVideos.has(videoId)) {
+                  // Also check no active transition references this video's scene
+                  const stillNeeded =
+                    activeTransition &&
+                    (sceneElements[activeTransition.fromScene]?.includes(videoId) ||
+                      sceneElements[activeTransition.toScene]?.includes(videoId));
+                  if (!stillNeeded) {
+                    const frameDir = hdrFrameDirs.get(videoId);
+                    if (frameDir) {
+                      try {
+                        rmSync(frameDir, { recursive: true, force: true });
+                      } catch (err) {
+                        log.warn("Failed to clean up HDR frame directory", {
+                          videoId,
+                          frameDir,
+                          error: err instanceof Error ? err.message : String(err),
+                        });
+                      }
+                      // Drop the matching cache entry so we don't leak a stale
+                      // max-frame-index reading for a directory that no longer
+                      // exists. Without this, the module-scoped cache grows
+                      // monotonically across renders.
+                      frameDirMaxIndexCache.delete(frameDir);
+                      hdrFrameDirs.delete(videoId);
+                    }
+                    cleanedUpVideos.add(videoId);
+                  }
+                }
+              }
+            }
+
+            job.framesRendered = i + 1;
+            if ((i + 1) % 10 === 0 || i + 1 === totalFrames) {
+              const frameProgress = (i + 1) / totalFrames;
+              updateJobStatus(
+                job,
+                "rendering",
+                `HDR composite frame ${i + 1}/${job.totalFrames}`,
+                Math.round(25 + frameProgress * 55),
+                onProgress,
+              );
+            }
+          }
+        } finally {
+          lastBrowserConsole = domSession.browserConsoleBuffer;
+          await closeCaptureSession(domSession);
+          domSessionClosed = true;
+        }
+
+        const hdrEncodeResult = await hdrEncoder.close();
+        hdrEncoderClosed = true;
+        assertNotAborted();
+        if (!hdrEncodeResult.success) {
+          throw new Error(`HDR encode failed: ${hdrEncodeResult.error}`);
+        }
+
+        perfStages.captureMs = Date.now() - stage4Start;
+        perfStages.encodeMs = hdrEncodeResult.durationMs;
+      } finally {
+        // Defensive cleanup: if anything between domSession creation and the
+        // success-path closes threw, the encoder ffmpeg subprocess and the
+        // browser would otherwise be leaked. Both close() methods are
+        // idempotent so it's safe to call them when the flags are already set,
+        // but we skip the redundant work to keep logs clean.
+        if (hdrEncoder && !hdrEncoderClosed) {
+          try {
+            await hdrEncoder.close();
+          } catch (err) {
+            log.warn("hdrEncoder defensive close failed", {
+              err: err instanceof Error ? err.message : String(err),
+            });
           }
         }
-      } finally {
-        lastBrowserConsole = domSession.browserConsoleBuffer;
-        await closeCaptureSession(domSession);
+        if (!domSessionClosed) {
+          await closeCaptureSession(domSession).catch((err) => {
+            log.warn("closeCaptureSession defensive close failed", {
+              err: err instanceof Error ? err.message : String(err),
+            });
+          });
+        }
+        // Drop frameDirMaxIndexCache entries for any HDR frame directories
+        // that survived the in-loop cleanup (early failures, KEEP_TEMP=1,
+        // videos still active when the render exits). The on-disk frames
+        // themselves are torn down with workDir; we just don't want the
+        // module-scoped cache to leak entries across renders.
+        for (const frameDir of hdrFrameDirs.values()) {
+          frameDirMaxIndexCache.delete(frameDir);
+        }
+        hdrFrameDirs.clear();
       }
-
-      const hdrEncodeResult = await hdrEncoder.close();
-      assertNotAborted();
-      if (!hdrEncodeResult.success) {
-        throw new Error(`HDR encode failed: ${hdrEncodeResult.error}`);
-      }
-
-      perfStages.captureMs = Date.now() - stage4Start;
-      perfStages.encodeMs = hdrEncodeResult.durationMs;
     } else // ── Standard capture paths (SDR or DOM-only HDR) ──────────────────
     // Streaming encode mode: pipe frame buffers directly to FFmpeg stdin,
     // skipping disk writes and the separate Stage 5 encode step.
     {
       let streamingEncoder: StreamingEncoder | null = null;
+      let streamingEncoderClosed = false;
 
       if (enableStreamingEncode) {
         streamingEncoder = await spawnStreamingEncoder(
@@ -1971,247 +2044,265 @@ export async function executeRenderJob(
         assertNotAborted();
       }
 
-      if (enableStreamingEncode && streamingEncoder) {
-        // ── Streaming capture + encode (Stage 4 absorbs Stage 5) ──────────
-        const reorderBuffer = createFrameReorderBuffer(0, totalFrames);
-        const currentEncoder = streamingEncoder;
+      try {
+        if (enableStreamingEncode && streamingEncoder) {
+          // ── Streaming capture + encode (Stage 4 absorbs Stage 5) ──────────
+          const reorderBuffer = createFrameReorderBuffer(0, totalFrames);
+          const currentEncoder = streamingEncoder;
 
-        if (workerCount > 1) {
-          // Parallel capture → streaming encode
-          const tasks = distributeFrames(job.totalFrames, workerCount, workDir);
+          if (workerCount > 1) {
+            // Parallel capture → streaming encode
+            const tasks = distributeFrames(job.totalFrames, workerCount, workDir);
 
-          const onFrameBuffer = async (frameIndex: number, buffer: Buffer): Promise<void> => {
-            await reorderBuffer.waitForFrame(frameIndex);
-            currentEncoder.writeFrame(buffer);
-            reorderBuffer.advanceTo(frameIndex + 1);
-          };
-
-          await executeParallelCapture(
-            fileServer.url,
-            workDir,
-            tasks,
-            { ...captureOptions, skipReadinessVideoIds: Array.from(nativeHdrVideoIds) },
-            () => createVideoFrameInjector(frameLookup),
-            abortSignal,
-            (progress) => {
-              job.framesRendered = progress.capturedFrames;
-              const frameProgress = progress.capturedFrames / progress.totalFrames;
-              const progressPct = 25 + frameProgress * 55;
-
-              if (
-                progress.capturedFrames % 30 === 0 ||
-                progress.capturedFrames === progress.totalFrames
-              ) {
-                updateJobStatus(
-                  job,
-                  "rendering",
-                  `Streaming frame ${progress.capturedFrames}/${progress.totalFrames} (${workerCount} workers)`,
-                  Math.round(progressPct),
-                  onProgress,
-                );
-              }
-            },
-            onFrameBuffer,
-            cfg,
-          );
-
-          if (probeSession) {
-            lastBrowserConsole = probeSession.browserConsoleBuffer;
-            await closeCaptureSession(probeSession);
-            probeSession = null;
-          }
-        } else {
-          // Sequential capture → streaming encode
-
-          const videoInjector = createVideoFrameInjector(frameLookup);
-          const session =
-            probeSession ??
-            (await createCaptureSession(
-              fileServer.url,
-              framesDir,
-              { ...captureOptions, skipReadinessVideoIds: Array.from(nativeHdrVideoIds) },
-              videoInjector,
-              cfg,
-            ));
-          if (probeSession) {
-            prepareCaptureSessionForReuse(session, framesDir, videoInjector);
-            probeSession = null;
-          }
-
-          try {
-            if (!session.isInitialized) {
-              await initializeSession(session);
-            }
-            assertNotAborted();
-            lastBrowserConsole = session.browserConsoleBuffer;
-
-            for (let i = 0; i < totalFrames; i++) {
-              assertNotAborted();
-              const time = i / job.config.fps;
-              const { buffer } = await captureFrameToBuffer(session, i, time);
-              await reorderBuffer.waitForFrame(i);
+            const onFrameBuffer = async (frameIndex: number, buffer: Buffer): Promise<void> => {
+              await reorderBuffer.waitForFrame(frameIndex);
               currentEncoder.writeFrame(buffer);
-              reorderBuffer.advanceTo(i + 1);
-              job.framesRendered = i + 1;
+              reorderBuffer.advanceTo(frameIndex + 1);
+            };
 
-              const frameProgress = (i + 1) / totalFrames;
-              const progress = 25 + frameProgress * 55;
+            await executeParallelCapture(
+              fileServer.url,
+              workDir,
+              tasks,
+              { ...captureOptions, skipReadinessVideoIds: Array.from(nativeHdrVideoIds) },
+              () => createVideoFrameInjector(frameLookup),
+              abortSignal,
+              (progress) => {
+                job.framesRendered = progress.capturedFrames;
+                const frameProgress = progress.capturedFrames / progress.totalFrames;
+                const progressPct = 25 + frameProgress * 55;
 
-              updateJobStatus(
-                job,
-                "rendering",
-                `Streaming frame ${i + 1}/${job.totalFrames}`,
-                Math.round(progress),
-                onProgress,
-              );
+                if (
+                  progress.capturedFrames % 30 === 0 ||
+                  progress.capturedFrames === progress.totalFrames
+                ) {
+                  updateJobStatus(
+                    job,
+                    "rendering",
+                    `Streaming frame ${progress.capturedFrames}/${progress.totalFrames} (${workerCount} workers)`,
+                    Math.round(progressPct),
+                    onProgress,
+                  );
+                }
+              },
+              onFrameBuffer,
+              cfg,
+            );
+
+            if (probeSession) {
+              lastBrowserConsole = probeSession.browserConsoleBuffer;
+              await closeCaptureSession(probeSession);
+              probeSession = null;
             }
-          } finally {
-            lastBrowserConsole = session.browserConsoleBuffer;
-            await closeCaptureSession(session);
-          }
-        }
+          } else {
+            // Sequential capture → streaming encode
 
-        // Close encoder and get result
-        const encodeResult = await currentEncoder.close();
-        assertNotAborted();
+            const videoInjector = createVideoFrameInjector(frameLookup);
+            const session =
+              probeSession ??
+              (await createCaptureSession(
+                fileServer.url,
+                framesDir,
+                { ...captureOptions, skipReadinessVideoIds: Array.from(nativeHdrVideoIds) },
+                videoInjector,
+                cfg,
+              ));
+            if (probeSession) {
+              prepareCaptureSessionForReuse(session, framesDir, videoInjector);
+              probeSession = null;
+            }
 
-        if (!encodeResult.success) {
-          throw new Error(`Streaming encode failed: ${encodeResult.error}`);
-        }
+            try {
+              if (!session.isInitialized) {
+                await initializeSession(session);
+              }
+              assertNotAborted();
+              lastBrowserConsole = session.browserConsoleBuffer;
 
-        perfStages.captureMs = Date.now() - stage4Start;
-        perfStages.encodeMs = encodeResult.durationMs; // Overlapped with capture
-      } else {
-        // ── Disk-based capture (original flow) ────────────────────────────
-        if (workerCount > 1) {
-          // Parallel capture
-          const tasks = distributeFrames(job.totalFrames, workerCount, workDir);
+              for (let i = 0; i < totalFrames; i++) {
+                assertNotAborted();
+                const time = i / job.config.fps;
+                const { buffer } = await captureFrameToBuffer(session, i, time);
+                await reorderBuffer.waitForFrame(i);
+                currentEncoder.writeFrame(buffer);
+                reorderBuffer.advanceTo(i + 1);
+                job.framesRendered = i + 1;
 
-          await executeParallelCapture(
-            fileServer.url,
-            workDir,
-            tasks,
-            { ...captureOptions, skipReadinessVideoIds: Array.from(nativeHdrVideoIds) },
-            () => createVideoFrameInjector(frameLookup),
-            abortSignal,
-            (progress) => {
-              job.framesRendered = progress.capturedFrames;
-              const frameProgress = progress.capturedFrames / progress.totalFrames;
-              const progressPct = 25 + frameProgress * 45;
+                const frameProgress = (i + 1) / totalFrames;
+                const progress = 25 + frameProgress * 55;
 
-              if (
-                progress.capturedFrames % 30 === 0 ||
-                progress.capturedFrames === progress.totalFrames
-              ) {
                 updateJobStatus(
                   job,
                   "rendering",
-                  `Capturing frame ${progress.capturedFrames}/${progress.totalFrames} (${workerCount} workers)`,
-                  Math.round(progressPct),
+                  `Streaming frame ${i + 1}/${job.totalFrames}`,
+                  Math.round(progress),
                   onProgress,
                 );
               }
-            },
-            undefined,
-            cfg,
-          );
-
-          await mergeWorkerFrames(workDir, tasks, framesDir);
-          if (probeSession) {
-            lastBrowserConsole = probeSession.browserConsoleBuffer;
-            await closeCaptureSession(probeSession);
-            probeSession = null;
+            } finally {
+              lastBrowserConsole = session.browserConsoleBuffer;
+              await closeCaptureSession(session);
+            }
           }
+
+          // Close encoder and get result
+          const encodeResult = await currentEncoder.close();
+          streamingEncoderClosed = true;
+          assertNotAborted();
+
+          if (!encodeResult.success) {
+            throw new Error(`Streaming encode failed: ${encodeResult.error}`);
+          }
+
+          perfStages.captureMs = Date.now() - stage4Start;
+          perfStages.encodeMs = encodeResult.durationMs; // Overlapped with capture
         } else {
-          // Sequential capture
+          // ── Disk-based capture (original flow) ────────────────────────────
+          if (workerCount > 1) {
+            // Parallel capture
+            const tasks = distributeFrames(job.totalFrames, workerCount, workDir);
 
-          const videoInjector = createVideoFrameInjector(frameLookup);
-          const session =
-            probeSession ??
-            (await createCaptureSession(
+            await executeParallelCapture(
               fileServer.url,
-              framesDir,
+              workDir,
+              tasks,
               { ...captureOptions, skipReadinessVideoIds: Array.from(nativeHdrVideoIds) },
-              videoInjector,
+              () => createVideoFrameInjector(frameLookup),
+              abortSignal,
+              (progress) => {
+                job.framesRendered = progress.capturedFrames;
+                const frameProgress = progress.capturedFrames / progress.totalFrames;
+                const progressPct = 25 + frameProgress * 45;
+
+                if (
+                  progress.capturedFrames % 30 === 0 ||
+                  progress.capturedFrames === progress.totalFrames
+                ) {
+                  updateJobStatus(
+                    job,
+                    "rendering",
+                    `Capturing frame ${progress.capturedFrames}/${progress.totalFrames} (${workerCount} workers)`,
+                    Math.round(progressPct),
+                    onProgress,
+                  );
+                }
+              },
+              undefined,
               cfg,
-            ));
-          if (probeSession) {
-            prepareCaptureSessionForReuse(session, framesDir, videoInjector);
-            probeSession = null;
-          }
-
-          try {
-            if (!session.isInitialized) {
-              await initializeSession(session);
-            }
-            assertNotAborted();
-            lastBrowserConsole = session.browserConsoleBuffer;
-
-            for (let i = 0; i < job.totalFrames; i++) {
-              assertNotAborted();
-              const time = i / job.config.fps;
-              await captureFrame(session, i, time);
-              job.framesRendered = i + 1;
-
-              const frameProgress = (i + 1) / job.totalFrames;
-              const progress = 25 + frameProgress * 45;
-
-              updateJobStatus(
-                job,
-                "rendering",
-                `Capturing frame ${i + 1}/${job.totalFrames}`,
-                Math.round(progress),
-                onProgress,
-              );
-            }
-          } finally {
-            lastBrowserConsole = session.browserConsoleBuffer;
-            await closeCaptureSession(session);
-          }
-        }
-
-        perfStages.captureMs = Date.now() - stage4Start;
-
-        // ── Stage 5: Encode ─────────────────────────────────────────────────
-        const stage5Start = Date.now();
-        updateJobStatus(job, "encoding", "Encoding video", 75, onProgress);
-
-        const frameExt = needsAlpha ? "png" : "jpg";
-        const framePattern = `frame_%06d.${frameExt}`;
-        const encoderOpts = {
-          fps: job.config.fps,
-          width,
-          height,
-          codec: preset.codec,
-          preset: preset.preset,
-          quality: preset.quality,
-          pixelFormat: preset.pixelFormat,
-          useGpu: job.config.useGpu,
-          hdr: preset.hdr,
-        };
-        const encodeResult = enableChunkedEncode
-          ? await encodeFramesChunkedConcat(
-              framesDir,
-              framePattern,
-              videoOnlyPath,
-              encoderOpts,
-              chunkedEncodeSize,
-              abortSignal,
-            )
-          : await encodeFramesFromDir(
-              framesDir,
-              framePattern,
-              videoOnlyPath,
-              encoderOpts,
-              abortSignal,
             );
-        assertNotAborted();
 
-        if (!encodeResult.success) {
-          throw new Error(`Encoding failed: ${encodeResult.error}`);
+            await mergeWorkerFrames(workDir, tasks, framesDir);
+            if (probeSession) {
+              lastBrowserConsole = probeSession.browserConsoleBuffer;
+              await closeCaptureSession(probeSession);
+              probeSession = null;
+            }
+          } else {
+            // Sequential capture
+
+            const videoInjector = createVideoFrameInjector(frameLookup);
+            const session =
+              probeSession ??
+              (await createCaptureSession(
+                fileServer.url,
+                framesDir,
+                { ...captureOptions, skipReadinessVideoIds: Array.from(nativeHdrVideoIds) },
+                videoInjector,
+                cfg,
+              ));
+            if (probeSession) {
+              prepareCaptureSessionForReuse(session, framesDir, videoInjector);
+              probeSession = null;
+            }
+
+            try {
+              if (!session.isInitialized) {
+                await initializeSession(session);
+              }
+              assertNotAborted();
+              lastBrowserConsole = session.browserConsoleBuffer;
+
+              for (let i = 0; i < job.totalFrames; i++) {
+                assertNotAborted();
+                const time = i / job.config.fps;
+                await captureFrame(session, i, time);
+                job.framesRendered = i + 1;
+
+                const frameProgress = (i + 1) / job.totalFrames;
+                const progress = 25 + frameProgress * 45;
+
+                updateJobStatus(
+                  job,
+                  "rendering",
+                  `Capturing frame ${i + 1}/${job.totalFrames}`,
+                  Math.round(progress),
+                  onProgress,
+                );
+              }
+            } finally {
+              lastBrowserConsole = session.browserConsoleBuffer;
+              await closeCaptureSession(session);
+            }
+          }
+
+          perfStages.captureMs = Date.now() - stage4Start;
+
+          // ── Stage 5: Encode ─────────────────────────────────────────────────
+          const stage5Start = Date.now();
+          updateJobStatus(job, "encoding", "Encoding video", 75, onProgress);
+
+          const frameExt = needsAlpha ? "png" : "jpg";
+          const framePattern = `frame_%06d.${frameExt}`;
+          const encoderOpts = {
+            fps: job.config.fps,
+            width,
+            height,
+            codec: preset.codec,
+            preset: preset.preset,
+            quality: preset.quality,
+            pixelFormat: preset.pixelFormat,
+            useGpu: job.config.useGpu,
+            hdr: preset.hdr,
+          };
+          const encodeResult = enableChunkedEncode
+            ? await encodeFramesChunkedConcat(
+                framesDir,
+                framePattern,
+                videoOnlyPath,
+                encoderOpts,
+                chunkedEncodeSize,
+                abortSignal,
+              )
+            : await encodeFramesFromDir(
+                framesDir,
+                framePattern,
+                videoOnlyPath,
+                encoderOpts,
+                abortSignal,
+              );
+          assertNotAborted();
+
+          if (!encodeResult.success) {
+            throw new Error(`Encoding failed: ${encodeResult.error}`);
+          }
+
+          perfStages.encodeMs = Date.now() - stage5Start;
         }
-
-        perfStages.encodeMs = Date.now() - stage5Start;
+      } finally {
+        // Defensive cleanup: if the streaming encoder branch threw before
+        // currentEncoder.close() (e.g. capture failure, abort, broken pipe),
+        // the ffmpeg subprocess would otherwise leak. close() is idempotent so
+        // this is safe to call alongside the success-path close — we just gate
+        // on the flag to avoid redundant work.
+        if (streamingEncoder && !streamingEncoderClosed) {
+          try {
+            await streamingEncoder.close();
+          } catch (err) {
+            log.warn("streamingEncoder defensive close failed", {
+              err: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
       }
     } // end SDR capture paths block
 
