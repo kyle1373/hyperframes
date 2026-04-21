@@ -42,6 +42,15 @@ jobs:
           - shard: load
             scenarios: load
             runs: "5"
+          - shard: fps
+            scenarios: fps
+            runs: "3"
+          - shard: scrub
+            scenarios: scrub
+            runs: "3"
+          - shard: drift
+            scenarios: drift
+            runs: "3"
     steps:
       - uses: actions/checkout@v4
 

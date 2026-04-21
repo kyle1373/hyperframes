@@ -32,6 +32,7 @@ export type PerfBaseline = {
   compLoadColdP95Ms: number;
   compLoadWarmP95Ms: number;
   fpsMin: number;
+  droppedFramesMax: number;
   scrubLatencyP95IsolatedMs: number;
   scrubLatencyP95InlineMs: number;
   driftMaxMs: number;

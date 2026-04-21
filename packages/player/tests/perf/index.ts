@@ -29,7 +29,10 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { runFps } from "./scenarios/02-fps.ts";
 import { runLoad } from "./scenarios/03-load.ts";
+import { runScrub } from "./scenarios/04-scrub.ts";
+import { runDrift } from "./scenarios/05-drift.ts";
 import { reportAndGate, type GateMode, type GateResult, type Metric } from "./perf-gate.ts";
 import { launchBrowser } from "./runner.ts";
 import { startServer } from "./server.ts";
@@ -38,7 +41,15 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const RESULTS_DIR = resolve(HERE, "results");
 const RESULTS_FILE = resolve(RESULTS_DIR, "metrics.json");
 
-type ScenarioId = "load";
+type ScenarioId = "load" | "fps" | "scrub" | "drift";
+
+/** Per-scenario default `runs` value when the caller didn't pass `--runs`. */
+const DEFAULT_RUNS: Record<ScenarioId, number> = {
+  load: 5,
+  fps: 3,
+  scrub: 3,
+  drift: 3,
+};
 
 type ResultsFile = {
   schemaVersion: 1;
@@ -88,7 +99,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     // `mode` is consumed (measure logs regressions but never fails; enforce
     // exits non-zero on regression).
     mode: (process.env.PLAYER_PERF_MODE as GateMode) === "enforce" ? "enforce" : "measure",
-    scenarios: ["load"],
+    scenarios: ["load", "fps", "scrub", "drift"],
     runs: null,
     fixture: null,
     headful: false,
@@ -150,7 +161,31 @@ async function main(): Promise<void> {
         const m = await runLoad({
           browser,
           origin: server.origin,
-          runs: args.runs ?? 5,
+          runs: args.runs ?? DEFAULT_RUNS.load,
+          fixture: args.fixture,
+        });
+        metrics.push(...m);
+      } else if (scenario === "fps") {
+        const m = await runFps({
+          browser,
+          origin: server.origin,
+          runs: args.runs ?? DEFAULT_RUNS.fps,
+          fixture: args.fixture,
+        });
+        metrics.push(...m);
+      } else if (scenario === "scrub") {
+        const m = await runScrub({
+          browser,
+          origin: server.origin,
+          runs: args.runs ?? DEFAULT_RUNS.scrub,
+          fixture: args.fixture,
+        });
+        metrics.push(...m);
+      } else if (scenario === "drift") {
+        const m = await runDrift({
+          browser,
+          origin: server.origin,
+          runs: args.runs ?? DEFAULT_RUNS.drift,
           fixture: args.fixture,
         });
         metrics.push(...m);
