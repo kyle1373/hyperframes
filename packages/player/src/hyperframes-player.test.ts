@@ -640,3 +640,160 @@ describe("HyperframesPlayer parent-proxy time-mirror coalescing", () => {
     expect(forcedCall).toBeDefined();
   });
 });
+
+// ── Synchronous seek() with same-origin detection ──
+//
+// Studio has long reached past the postMessage bridge and called the runtime's
+// `__player.seek` directly (`useTimelinePlayer.ts:233`) — that's the only way
+// to land a scrubbed frame in the same task as the input event so the user
+// sees no perceived lag. P3-1 promotes that pattern to a public API: the
+// player element's own `seek()` now tries the same shortcut first, and only
+// falls back to the async postMessage bridge when the iframe is genuinely
+// cross-origin (or the runtime hasn't installed `__player` yet). The tests
+// here stub `iframe.contentWindow` so we can exercise the branch matrix
+// without booting an actual runtime.
+
+describe("HyperframesPlayer seek() sync path", () => {
+  type SyncPlayerStub = {
+    seek?: (t: number) => void;
+    play?: () => void;
+    pause?: () => void;
+  };
+  type FakeContentWindow = {
+    __player?: SyncPlayerStub;
+    postMessage?: ReturnType<typeof vi.fn>;
+  };
+  type PlayerInternal = HTMLElement & {
+    seek: (t: number) => void;
+    iframe: HTMLIFrameElement;
+    _currentTime: number;
+  };
+
+  let player: PlayerInternal;
+
+  beforeEach(async () => {
+    await import("./hyperframes-player.js");
+    player = document.createElement("hyperframes-player") as PlayerInternal;
+    document.body.appendChild(player);
+  });
+
+  afterEach(() => {
+    player.remove();
+    vi.restoreAllMocks();
+  });
+
+  // Replace the iframe's `contentWindow` getter so the test controls what the
+  // sync path sees. Passing `"throw"` simulates the cross-origin SecurityError
+  // a real browser raises when reading `contentWindow.<anything>`.
+  function stubContentWindow(stub: FakeContentWindow | "throw") {
+    Object.defineProperty(player.iframe, "contentWindow", {
+      configurable: true,
+      get() {
+        if (stub === "throw") throw new Error("SecurityError");
+        return stub;
+      },
+    });
+  }
+
+  it("calls __player.seek directly on the same-origin path", () => {
+    // The whole point of P3-1: when the runtime is reachable, scrubs land in
+    // the same task as the input. `postMessage` must NOT also fire — that
+    // would cause a duplicate, async re-seek a tick later.
+    const sync = vi.fn();
+    const post = vi.fn();
+    stubContentWindow({ __player: { seek: sync }, postMessage: post });
+
+    player.seek(12.5);
+
+    expect(sync).toHaveBeenCalledTimes(1);
+    expect(sync).toHaveBeenCalledWith(12.5);
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  it("passes the raw time-in-seconds through, not a rounded frame number", () => {
+    // The postMessage bridge has to round to a frame at the wire boundary,
+    // but the in-process call accepts seconds directly — preserving the
+    // caller's precision for fractional scrubs.
+    const sync = vi.fn();
+    stubContentWindow({ __player: { seek: sync } });
+
+    player.seek(7.3333);
+
+    expect(sync).toHaveBeenCalledWith(7.3333);
+  });
+
+  it("falls back to postMessage when __player has not been installed yet", () => {
+    // Before the runtime bootstraps, `contentWindow` exists but `__player` is
+    // undefined. The fallback queues the seek via postMessage, which the
+    // runtime drains once `installRuntimeControlBridge` runs.
+    const post = vi.fn();
+    stubContentWindow({ postMessage: post });
+
+    player.seek(12.5);
+
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: "hf-parent",
+        type: "control",
+        action: "seek",
+        frame: Math.round(12.5 * 30),
+      }),
+      "*",
+    );
+  });
+
+  it("falls back to postMessage when __player exists but lacks seek()", () => {
+    // Defensive: a partial `__player` (e.g. older runtime, mocked stub) must
+    // not be assumed callable. `typeof seek !== "function"` guards this.
+    const post = vi.fn();
+    stubContentWindow({
+      __player: { play: vi.fn(), pause: vi.fn() },
+      postMessage: post,
+    });
+
+    player.seek(7);
+
+    expect(post).toHaveBeenCalledWith(expect.objectContaining({ action: "seek", frame: 210 }), "*");
+  });
+
+  it("does not throw when contentWindow access raises (cross-origin embed)", () => {
+    // Reading `iframe.contentWindow` on a true cross-origin iframe throws a
+    // DOMException. Both `_trySyncSeek` AND the postMessage fallback hit the
+    // same getter, so both swallow the error — the public seek() must remain
+    // a clean no-op surface for the caller.
+    stubContentWindow("throw");
+
+    expect(() => player.seek(12.5)).not.toThrow();
+  });
+
+  it("falls back to postMessage when __player.seek throws at runtime", () => {
+    // If the runtime's seek implementation panics, we catch in `_trySyncSeek`
+    // and degrade to the bridge. The postMessage path runs in a separate
+    // task — it may succeed where the sync call failed, and at worst the
+    // failure mode is identical.
+    const sync = vi.fn(() => {
+      throw new Error("runtime panic");
+    });
+    const post = vi.fn();
+    stubContentWindow({ __player: { seek: sync }, postMessage: post });
+
+    expect(() => player.seek(12.5)).not.toThrow();
+    expect(post).toHaveBeenCalledWith(expect.objectContaining({ action: "seek" }), "*");
+  });
+
+  it("updates _currentTime regardless of which path is taken", () => {
+    // `_currentTime` is the parent-side cache that drives controls and parent
+    // proxy mirroring. It must update unconditionally — otherwise scrubs on a
+    // cross-origin embed leave the controls UI showing stale time.
+    const sync = vi.fn();
+    stubContentWindow({ __player: { seek: sync } });
+    player.seek(8.25);
+    expect(player._currentTime).toBe(8.25);
+
+    // Reset and verify the fallback path produces the same caching behavior.
+    stubContentWindow({ postMessage: vi.fn() });
+    player.seek(11);
+    expect(player._currentTime).toBe(11);
+  });
+});

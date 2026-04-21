@@ -244,8 +244,15 @@ class HyperframesPlayer extends HTMLElement {
   }
 
   seek(timeInSeconds: number) {
-    const frame = Math.round(timeInSeconds * DEFAULT_FPS);
-    this._sendControl("seek", { frame });
+    // Prefer the same-origin sync path — `__player.seek` lands the new frame
+    // in the same task as the input event, so scrub UIs see immediate visual
+    // feedback. Cross-origin embeds (anywhere reading `contentWindow.__player`
+    // throws or returns nothing) fall back to the postMessage bridge, which
+    // preserves the original async semantics for external hosts.
+    if (!this._trySyncSeek(timeInSeconds)) {
+      const frame = Math.round(timeInSeconds * DEFAULT_FPS);
+      this._sendControl("seek", { frame });
+    }
     this._currentTime = timeInSeconds;
 
     // Mirror parent proxy currentTime only while parent owns audible output.
@@ -314,6 +321,37 @@ class HyperframesPlayer extends HTMLElement {
       );
     } catch {
       /* cross-origin */
+    }
+  }
+
+  /**
+   * Reach into the runtime's `window.__player.seek` directly, skipping the
+   * postMessage hop. Same-origin only — cross-origin embeds throw a
+   * `SecurityError` on `contentWindow` property access, which we catch and
+   * report as a no-op so the caller can transparently fall back to the
+   * postMessage bridge. Returns `true` only when the runtime accepted the
+   * call (`__player.seek` exists, is callable, and didn't throw).
+   *
+   * Studio has used this access path privately via `iframe.contentWindow.__player`
+   * (see `useTimelinePlayer.ts`); this helper just formalizes the same
+   * detection inside the player so external scrub UIs get the same
+   * single-task latency. The runtime-side `seek` is the same wrapped
+   * function the postMessage handler calls (`installRuntimeControlBridge`
+   * routes through `player.seek`), so `markExplicitSeek()` and downstream
+   * runtime state stay identical between the two paths.
+   */
+  private _trySyncSeek(timeInSeconds: number): boolean {
+    try {
+      const win = this.iframe.contentWindow as
+        | (Window & { __player?: { seek?: (t: number) => void } })
+        | null;
+      const player = win?.__player;
+      const seek = player?.seek;
+      if (typeof seek !== "function") return false;
+      seek.call(player, timeInSeconds);
+      return true;
+    } catch {
+      return false;
     }
   }
 
