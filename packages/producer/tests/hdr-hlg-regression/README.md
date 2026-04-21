@@ -13,7 +13,7 @@ so the HLG-specific encoder/metadata path stays tested in isolation.
 
 The test pins the contract that:
 
-- `extractVideoMetadata` reports `bt2020/arib-std-b67/limited` for the HLG
+- `extractMediaMetadata` reports `bt2020/arib-std-b67/limited` for the HLG
   source (i.e. HLG is detected and not silently coerced to PQ).
 - `isHdrColorSpace` flips the orchestrator into the layered HDR path on the
   HLG signal.
