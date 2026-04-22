@@ -5,12 +5,12 @@ interface VideoThumbnailProps {
   videoSrc: string;
   label: string;
   labelColor: string;
+  seekTime?: number;
   duration?: number;
+  playbackRate?: number;
 }
 
 const CLIP_HEIGHT = 66;
-const MAX_UNIQUE_FRAMES: number = 6;
-
 /**
  * Renders a film-strip of video frames extracted client-side via a hidden
  * <video> + <canvas>. Each frame is a fixed-width tile; frames repeat to
@@ -20,7 +20,9 @@ export const VideoThumbnail = memo(function VideoThumbnail({
   videoSrc,
   label,
   labelColor,
+  seekTime = 0,
   duration = 5,
+  playbackRate = 1,
 }: VideoThumbnailProps) {
   const [containerWidth, setContainerWidth] = useState(0);
   const [visible, setVisible] = useState(false);
@@ -81,13 +83,7 @@ export const VideoThumbnail = memo(function VideoThumbnail({
       return;
     }
 
-    const timestamps: number[] = [];
-    const minSeek = Math.min(0.4, duration * 0.05);
-    for (let i = 0; i < MAX_UNIQUE_FRAMES; i++) {
-      const raw =
-        MAX_UNIQUE_FRAMES === 1 ? duration * 0.15 : (i / (MAX_UNIQUE_FRAMES - 1)) * duration;
-      timestamps.push(Math.max(raw, minSeek));
-    }
+    const timestamps: number[] = [Math.max(0, seekTime + (duration * playbackRate) / 2)];
 
     let idx = 0;
     let cancelled = false;
@@ -138,7 +134,7 @@ export const VideoThumbnail = memo(function VideoThumbnail({
       video.src = "";
       video.load();
     };
-  }, [visible, videoSrc, duration]);
+  }, [visible, videoSrc, seekTime, duration, playbackRate]);
 
   const frameW = Math.round(CLIP_HEIGHT * aspect);
   const frameCount = containerWidth > 0 ? Math.max(1, Math.ceil(containerWidth / frameW)) : 1;

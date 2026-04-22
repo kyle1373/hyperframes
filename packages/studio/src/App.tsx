@@ -299,7 +299,9 @@ export function StudioApp() {
             videoSrc={mediaSrc}
             label={el.id || el.tag}
             labelColor={style.label}
+            seekTime={el.playbackStart ?? 0}
             duration={el.duration}
+            playbackRate={el.playbackRate ?? 1}
           />
         );
       }

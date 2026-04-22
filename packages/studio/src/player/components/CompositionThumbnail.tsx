@@ -22,7 +22,7 @@ export const CompositionThumbnail = memo(function CompositionThumbnail({
   labelColor,
   accentColor = "#6B7280",
   selector,
-  seekTime = 2,
+  seekTime = 0,
   duration = 5,
 }: CompositionThumbnailProps) {
   const [containerWidth, setContainerWidth] = useState(0);

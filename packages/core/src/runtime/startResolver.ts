@@ -124,6 +124,17 @@ export function createRuntimeStartTimeResolver(params: {
     return null;
   };
 
+  const resolveHostOffsetForElement = (element: Element, fallback: number): number => {
+    if (element.hasAttribute("data-composition-id")) {
+      const parentComposition = element.parentElement?.closest("[data-composition-id]");
+      if (!parentComposition) return 0;
+      return resolveStartForElementInternal(parentComposition, fallback);
+    }
+    const compositionRoot = element.closest("[data-composition-id]");
+    if (!compositionRoot) return 0;
+    return resolveStartForElementInternal(compositionRoot, fallback);
+  };
+
   const resolveStartForElementInternal = (element: Element, fallback: number): number => {
     const cached = startCache.get(element);
     if (cached !== undefined) {
@@ -159,8 +170,9 @@ export function createRuntimeStartTimeResolver(params: {
       }
       if (expression.kind === "absolute") {
         const absolute = Math.max(0, expression.value);
-        startCache.set(element, absolute);
-        return absolute;
+        const resolved = Math.max(0, resolveHostOffsetForElement(element, fallback) + absolute);
+        startCache.set(element, resolved);
+        return resolved;
       }
       const target = findReferenceTarget(expression.refId);
       if (!target) {

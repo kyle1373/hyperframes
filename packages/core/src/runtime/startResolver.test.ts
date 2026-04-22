@@ -158,6 +158,89 @@ describe("createRuntimeStartTimeResolver", () => {
       expect(resolver.resolveStartForElement(slide3)).toBe(26);
     });
 
+    it("adds composition host offset for nested absolute starts", () => {
+      const host = document.createElement("div");
+      host.id = "slide-5";
+      host.setAttribute("data-composition-id", "slide-video-agent");
+      host.setAttribute("data-start", "54");
+      host.setAttribute("data-duration", "45");
+      document.body.appendChild(host);
+
+      const innerRoot = document.createElement("div");
+      innerRoot.setAttribute("data-composition-id", "slide-video-agent");
+      host.appendChild(innerRoot);
+
+      const video = document.createElement("video");
+      video.setAttribute("data-start", "0");
+      innerRoot.appendChild(video);
+
+      const resolver = createRuntimeStartTimeResolver({});
+      expect(resolver.resolveStartForElement(video)).toBe(54);
+    });
+
+    it("keeps nested references in the host composition timeline", () => {
+      const host = document.createElement("div");
+      host.id = "slide-5";
+      host.setAttribute("data-composition-id", "slide-video-agent");
+      host.setAttribute("data-start", "54");
+      host.setAttribute("data-duration", "45");
+      document.body.appendChild(host);
+
+      const innerRoot = document.createElement("div");
+      innerRoot.setAttribute("data-composition-id", "slide-video-agent");
+      host.appendChild(innerRoot);
+
+      const firstClip = document.createElement("div");
+      firstClip.id = "bullet-reveal";
+      firstClip.setAttribute("data-start", "1");
+      firstClip.setAttribute("data-duration", "2");
+      innerRoot.appendChild(firstClip);
+
+      const secondClip = document.createElement("div");
+      secondClip.setAttribute("data-start", "bullet-reveal + 1");
+      innerRoot.appendChild(secondClip);
+
+      const resolver = createRuntimeStartTimeResolver({});
+      expect(resolver.resolveStartForElement(firstClip)).toBe(55);
+      expect(resolver.resolveStartForElement(secondClip)).toBe(58);
+    });
+
+    it("adds the nearest composition root start for nested absolute media in inlined compositions", () => {
+      const root = document.createElement("div");
+      root.setAttribute("data-composition-id", "main");
+      document.body.appendChild(root);
+
+      const slide1 = document.createElement("div");
+      slide1.id = "slide-1";
+      slide1.setAttribute("data-composition-id", "slide-core-conviction");
+      slide1.setAttribute("data-start", "0");
+      slide1.setAttribute("data-hf-authored-duration", "14");
+      root.appendChild(slide1);
+
+      const slide2 = document.createElement("div");
+      slide2.id = "slide-2";
+      slide2.setAttribute("data-composition-id", "slide-avatar-v");
+      slide2.setAttribute("data-start", "slide-1");
+      slide2.setAttribute("data-hf-authored-duration", "12");
+      root.appendChild(slide2);
+
+      const slide3 = document.createElement("div");
+      slide3.id = "slide-3";
+      slide3.setAttribute("data-composition-id", "slide-translation");
+      slide3.setAttribute("data-start", "slide-2");
+      slide3.setAttribute("data-hf-authored-duration", "16");
+      root.appendChild(slide3);
+
+      const video = document.createElement("video");
+      video.setAttribute("data-start", "0");
+      slide3.appendChild(video);
+
+      const resolver = createRuntimeStartTimeResolver({});
+      expect(resolver.resolveStartForElement(slide2)).toBe(14);
+      expect(resolver.resolveStartForElement(slide3)).toBe(26);
+      expect(resolver.resolveStartForElement(video)).toBe(26);
+    });
+
     it("returns fallback when reference target not found", () => {
       const el = document.createElement("div");
       el.setAttribute("data-start", "nonexistent");

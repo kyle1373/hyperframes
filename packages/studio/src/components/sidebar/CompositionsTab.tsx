@@ -1,4 +1,4 @@
-import { memo, useRef, useState } from "react";
+import { memo, useRef, useState, useEffect } from "react";
 
 interface CompositionsTabProps {
   projectId: string;
@@ -19,6 +19,7 @@ function CompCard({
   onSelect: () => void;
 }) {
   const [hovered, setHovered] = useState(false);
+  const [thumbnailTime, setThumbnailTime] = useState(2);
   const hoverTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const handleEnter = () => {
     hoverTimer.current = setTimeout(() => setHovered(true), 300);
@@ -31,8 +32,30 @@ function CompCard({
     setHovered(false);
   };
   const name = comp.replace(/^compositions\//, "").replace(/\.html$/, "");
-  const thumbnailUrl = `/api/projects/${projectId}/thumbnail/${comp}?t=2`;
+  const thumbnailUrl = `/api/projects/${projectId}/thumbnail/${comp}?t=${thumbnailTime.toFixed(2)}`;
   const previewUrl = `/api/projects/${projectId}/preview/comp/${comp}`;
+
+  // Sidebar composition thumbnails should also represent the clip midpoint,
+  // not a hard-coded early frame.
+  // eslint-disable-next-line no-restricted-syntax
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`/api/projects/${projectId}/files/${encodeURIComponent(comp)}`)
+      .then((r) => r.json())
+      .then((data: { content?: string }) => {
+        if (cancelled || !data.content) return;
+        const doc = new DOMParser().parseFromString(data.content, "text/html");
+        const durationAttr = doc.querySelector("[data-duration]")?.getAttribute("data-duration");
+        const duration = durationAttr ? parseFloat(durationAttr) : NaN;
+        if (Number.isFinite(duration) && duration > 0) {
+          setThumbnailTime(duration / 2);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [comp, projectId]);
 
   return (
     <div
