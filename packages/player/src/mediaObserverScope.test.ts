@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { selectMediaObserverTargets } from "./mediaObserverScope.js";
 
 afterEach(() => {
   document.body.innerHTML = "";
+  vi.restoreAllMocks();
 });
 
 function makeDoc(html: string): Document {
@@ -98,5 +99,94 @@ describe("selectMediaObserverTargets", () => {
     const targets = selectMediaObserverTargets(doc);
 
     expect(targets).toEqual([]);
+  });
+
+  describe("body-fallback collision warning", () => {
+    it("warns when scoped observation skips body-level timed media", () => {
+      // Composition host present → scoped path. The body-level <audio data-start>
+      // is outside every host subtree, so the observer would never see it.
+      // This is precisely the silent-miss the warning is designed to surface.
+      const doc = makeDoc(`
+        <audio data-start="0" src="theme.mp3"></audio>
+        <div data-composition-id="root">
+          <video data-start="1" src="hero.mp4"></video>
+        </div>
+      `);
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      selectMediaObserverTargets(doc);
+
+      expect(warn).toHaveBeenCalledTimes(1);
+      const [message, orphans] = warn.mock.calls[0] ?? [];
+      expect(typeof message).toBe("string");
+      expect(message).toContain("body-level timed media");
+      expect(Array.isArray(orphans)).toBe(true);
+      expect((orphans as Element[]).map((el) => el.tagName)).toEqual(["AUDIO"]);
+    });
+
+    it("does not warn when every body-level timed media element lives inside a host", () => {
+      // Same body-level audio as above, but now nested under a composition
+      // host — the scoped observer will pick it up via the host subtree, so
+      // there's no silent-miss to flag.
+      const doc = makeDoc(`
+        <div data-composition-id="root">
+          <audio data-start="0" src="theme.mp3"></audio>
+          <video data-start="1" src="hero.mp4"></video>
+        </div>
+      `);
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      selectMediaObserverTargets(doc);
+
+      expect(warn).not.toHaveBeenCalled();
+    });
+
+    it("does not warn on the body-fallback path even with orphan timed media", () => {
+      // No composition hosts → fallback observer attaches to `doc.body`, which
+      // already covers any body-level media. Emitting the warning here would
+      // be noise on every legacy / pre-bootstrap document.
+      const doc = makeDoc(`
+        <audio data-start="0" src="theme.mp3"></audio>
+      `);
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      selectMediaObserverTargets(doc);
+
+      expect(warn).not.toHaveBeenCalled();
+    });
+
+    it("ignores body-level audio/video that are not timed (no data-start)", () => {
+      // Untimed media isn't part of the time-sync pipeline, so it doesn't
+      // matter whether the observer sees it. Only `[data-start]` orphans
+      // qualify as a silent miss worth surfacing.
+      const doc = makeDoc(`
+        <audio src="ambient.mp3"></audio>
+        <div data-composition-id="root"></div>
+      `);
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      selectMediaObserverTargets(doc);
+
+      expect(warn).not.toHaveBeenCalled();
+    });
+
+    it("emits a single warn for multiple orphaned timed media elements", () => {
+      // The whole point of the forensic guard is to give a single, batched
+      // signal. Spamming one warn per orphan would drown out the diagnostic
+      // value on documents with many late-bound clips.
+      const doc = makeDoc(`
+        <audio data-start="0" src="a.mp3"></audio>
+        <video data-start="1" src="b.mp4"></video>
+        <audio data-start="2" src="c.mp3"></audio>
+        <div data-composition-id="root"></div>
+      `);
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      selectMediaObserverTargets(doc);
+
+      expect(warn).toHaveBeenCalledTimes(1);
+      const [, orphans] = warn.mock.calls[0] ?? [];
+      expect((orphans as Element[]).map((el) => el.tagName)).toEqual(["AUDIO", "VIDEO", "AUDIO"]);
+    });
   });
 });

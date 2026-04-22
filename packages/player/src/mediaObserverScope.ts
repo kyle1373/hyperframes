@@ -28,6 +28,14 @@
  * will be) composition-structured. Returns an empty array when neither a
  * host nor a body is available — the caller should treat that as "nothing
  * to observe".
+ *
+ * When the scoped path is taken but the body still carries timed media
+ * outside every host, a `console.warn` fires once per call as a forensic
+ * signal: the new scope skips that media, so any `<audio data-start>` /
+ * `<video data-start>` injected at body level will silently never get a
+ * parent-frame proxy. Today every runtime path appends inside a host so
+ * this branch shouldn't trip; if it does, the warn surfaces the drift
+ * immediately rather than presenting as a missing-audio bug downstream.
  */
 export function selectMediaObserverTargets(doc: Document): Element[] {
   const all = Array.from(doc.querySelectorAll<Element>("[data-composition-id]"));
@@ -41,7 +49,44 @@ export function selectMediaObserverTargets(doc: Document): Element[] {
       topLevel.push(el);
     }
   }
+
+  warnOnUnscopedTimedMedia(doc);
   return topLevel;
+}
+
+/**
+ * Forensic guard: with composition hosts present the observer attaches only
+ * to those subtrees, so any timed media sitting at body level (or under a
+ * non-host wrapper) is invisible to the adoption pipeline. Walk the body for
+ * `[data-start]` audio/video that has no `[data-composition-id]` ancestor
+ * and emit a single `console.warn` listing the orphans. The walk is cheap
+ * (one `querySelectorAll` over a typed selector + a `closest` per match)
+ * and only runs on the scoped path, so the no-host fallback retains its
+ * legacy behavior with zero extra work.
+ */
+function warnOnUnscopedTimedMedia(doc: Document): void {
+  const body = doc.body;
+  if (!body) return;
+  if (typeof console === "undefined" || typeof console.warn !== "function") return;
+
+  const candidates = body.querySelectorAll<HTMLMediaElement>(
+    "audio[data-start], video[data-start]",
+  );
+  if (candidates.length === 0) return;
+
+  const orphans: HTMLMediaElement[] = [];
+  for (const el of candidates) {
+    if (!el.closest("[data-composition-id]")) orphans.push(el);
+  }
+  if (orphans.length === 0) return;
+
+  console.warn(
+    "[hyperframes-player] selectMediaObserverTargets: composition hosts are present, " +
+      `but ${orphans.length} body-level timed media element(s) sit outside every ` +
+      "[data-composition-id] subtree and will not be observed. Move them inside a " +
+      "composition host or the parent-frame proxy will never adopt them.",
+    orphans,
+  );
 }
 
 function hasCompositionAncestor(el: Element): boolean {
