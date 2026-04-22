@@ -12,12 +12,12 @@ interface PlaybackAdapter {
 }
 
 interface TimelineLike {
-  play: () => void;
-  pause: () => void;
-  seek: (time: number) => void;
-  time: () => number;
-  duration: () => number;
-  isActive: () => boolean;
+  play?: () => void;
+  pause?: () => void;
+  seek?: (time: number) => void;
+  time?: () => number;
+  duration?: () => number;
+  isActive?: () => boolean;
 }
 
 interface ClipManifestClip {
@@ -48,16 +48,22 @@ type IframeWindow = Window & {
 };
 
 function wrapTimeline(tl: TimelineLike): PlaybackAdapter {
+  const safeNumber = (fn: (() => number) | undefined, fallback: number): number => {
+    if (typeof fn !== "function") return fallback;
+    const value = fn();
+    return Number.isFinite(value) ? value : fallback;
+  };
+
   return {
-    play: () => tl.play(),
-    pause: () => tl.pause(),
+    play: () => tl.play?.(),
+    pause: () => tl.pause?.(),
     seek: (t) => {
-      tl.pause();
-      tl.seek(t);
+      tl.pause?.();
+      tl.seek?.(t);
     },
-    getTime: () => tl.time(),
-    getDuration: () => tl.duration(),
-    isPlaying: () => tl.isActive(),
+    getTime: () => safeNumber(tl.time, 0),
+    getDuration: () => Math.max(0, safeNumber(tl.duration, 0)),
+    isPlaying: () => (typeof tl.isActive === "function" ? Boolean(tl.isActive()) : false),
   };
 }
 

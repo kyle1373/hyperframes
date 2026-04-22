@@ -18,6 +18,11 @@ import { CaptionTimeline } from "./captions/components/CaptionTimeline";
 import { useCaptionStore } from "./captions/store";
 import { useCaptionSync } from "./captions/hooks/useCaptionSync";
 import { parseCaptionComposition } from "./captions/parser";
+import { DirectEditOverlay } from "./editor/DirectEditOverlay";
+import { useDirectEditStore } from "./editor/directEditStore";
+import { CopilotPanel } from "./editor/CopilotPanel";
+import { useCopilotStore } from "./editor/copilotStore";
+import { wasStudioSaveWithin } from "./editor/htmlMutation";
 
 interface EditingFile {
   path: string;
@@ -26,25 +31,76 @@ interface EditingFile {
 
 // ── Main App ──
 
+/**
+ * Full-bleed overlay for the preview only. Rendered inside NLELayout's
+ * `previewOverlay` slot (which is itself absolutely-positioned over the
+ * iframe), so it covers just the composition — not the entire Studio
+ * chrome. The Copilot panel remains fully interactive while the agent
+ * works.
+ */
+function AgentBusyOverlay() {
+  return (
+    <div
+      className="absolute inset-0 flex items-center justify-center pointer-events-auto"
+      style={{
+        background: "rgba(4, 18, 28, 0.35)",
+        backdropFilter: "blur(3px)",
+        WebkitBackdropFilter: "blur(3px)",
+        zIndex: 60,
+      }}
+    >
+      <div className="flex flex-col items-center gap-3 px-6 py-4 rounded-xl border border-studio-accent/40 bg-neutral-950/85 shadow-xl">
+        <div className="w-8 h-8 rounded-full border-2 border-studio-accent border-t-transparent animate-spin" />
+        <div className="text-[11px] tracking-[0.4em] uppercase text-studio-accent">
+          Agent in control
+        </div>
+        <div className="text-[12px] text-neutral-400 max-w-[280px] text-center">
+          Claude is editing this composition. Watch the Copilot panel for live progress.
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function StudioApp() {
   const [projectId, setProjectId] = useState<string | null>(null);
   const [resolving, setResolving] = useState(true);
 
   useMountEffect(() => {
+    // Route priority:
+    //   1. Explicit hash   → `#project/<id>`   (what the Studio writes)
+    //   2. URL pathname    → `/<id>`           (friendlier to type/share)
+    //   3. First project from the API
+    //
+    // Vite's dev server falls back to `index.html` for unknown routes, so
+    // `http://localhost:5190/diamond-8bit` lands here with pathname
+    // `/diamond-8bit` and no hash.  Previously that path was ignored and
+    // we auto-selected the first project alphabetically ("demo") — which
+    // is exactly the reported bug.
     const hashMatch = window.location.hash.match(/^#project\/([^/]+)/);
     if (hashMatch) {
       setProjectId(hashMatch[1]);
       setResolving(false);
       return;
     }
-    // No hash — auto-select first available project
+
+    const pathMatch = window.location.pathname.match(/^\/([^/?#]+)\/?$/);
+    const pathProjectId = pathMatch?.[1];
+
     fetch("/api/projects")
       .then((r) => r.json())
       .then((data) => {
-        const first = (data.projects ?? [])[0];
-        if (first) {
-          setProjectId(first.id);
-          window.location.hash = `#project/${first.id}`;
+        const projects = (data.projects ?? []) as Array<{ id: string }>;
+        // Prefer the pathname-derived id if it's a real project.
+        const resolved =
+          (pathProjectId && projects.find((p) => p.id === pathProjectId)?.id) ??
+          projects[0]?.id;
+        if (resolved) {
+          setProjectId(resolved);
+          // Pin the hash so subsequent reloads skip this round-trip, and
+          // normalise the pathname back to root so refresh still works
+          // after hash changes.
+          window.history.replaceState(null, "", `/#project/${resolved}`);
         }
       })
       .catch(() => {})
@@ -59,6 +115,16 @@ export function StudioApp() {
   const captionEditMode = useCaptionStore((s) => s.isEditMode);
   const captionHasSelection = useCaptionStore((s) => s.selectedSegmentIds.size > 0);
   const captionSync = useCaptionSync(projectId);
+
+  // Direct-manipulation edit mode (click/drag/text/delete against the preview).
+  const directEditEnabled = useDirectEditStore((s) => s.enabled);
+  const toggleDirectEdit = useDirectEditStore((s) => s.toggleEnabled);
+  const setDirectEditEnabled = useDirectEditStore((s) => s.setEnabled);
+
+  // Copilot panel visibility and "agent in control" flag.
+  const copilotOpen = useCopilotStore((s) => s.open);
+  const toggleCopilot = useCopilotStore((s) => s.toggleOpen);
+  const agentBusy = useCopilotStore((s) => s.agentBusy);
 
   // Resizable and collapsible panel widths
   const [leftWidth, setLeftWidth] = useState(240);
@@ -184,6 +250,12 @@ export function StudioApp() {
       setRightCollapsed(!captionHasSelection);
     }
   }, [captionHasSelection, captionEditMode]);
+
+  // Disable direct-edit automatically when caption-edit mode takes over.
+  // eslint-disable-next-line no-restricted-syntax
+  useEffect(() => {
+    if (captionEditMode && directEditEnabled) setDirectEditEnabled(false);
+  }, [captionEditMode, directEditEnabled, setDirectEditEnabled]);
   const [globalDragOver, setGlobalDragOver] = useState(false);
   const [uploadToast, setUploadToast] = useState<string | null>(null);
   const [timelineVisible, setTimelineVisible] = useState(false);
@@ -300,6 +372,12 @@ export function StudioApp() {
   // In dev: use Vite HMR. In embedded/production: use SSE from /api/events.
   useMountEffect(() => {
     const handler = () => {
+      // Ignore file-change events fired by our own overlay/AI edits — the
+      // iframe DOM has already been updated in place. A reload here would
+      // restart the GSAP timeline from frame 0 and visually snap the user's
+      // just-dragged element back to its pre-edit position while the seek
+      // catches up.
+      if (wasStudioSaveWithin(1500)) return;
       if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
       refreshTimerRef.current = setTimeout(() => setRefreshKey((k) => k + 1), 400);
     };
@@ -654,6 +732,68 @@ export function StudioApp() {
         {/* Right: toolbar buttons */}
         <div className="flex items-center gap-1.5">
           <button
+            onClick={() => toggleDirectEdit()}
+            disabled={captionEditMode}
+            className={`h-7 flex items-center gap-1.5 px-2.5 rounded-md text-[11px] font-medium border transition-colors ${
+              directEditEnabled
+                ? "text-studio-accent bg-studio-accent/10 border-studio-accent/30"
+                : "text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800 border-transparent"
+            } ${captionEditMode ? "opacity-40 cursor-not-allowed" : ""}`}
+            title={
+              captionEditMode
+                ? "Disabled while Captions edit mode is active"
+                : directEditEnabled
+                  ? "Exit edit mode"
+                  : "Edit mode: click to select, drag to move, double-click to edit text, Delete to remove"
+            }
+          >
+            <svg
+              width="12"
+              height="12"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M12 20h9" />
+              <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4z" />
+            </svg>
+            Edit
+          </button>
+          <button
+            onClick={() => toggleCopilot()}
+            className={`h-7 flex items-center gap-1.5 px-2.5 rounded-md text-[11px] font-medium border transition-colors ${
+              copilotOpen
+                ? "text-studio-accent bg-studio-accent/10 border-studio-accent/30"
+                : "text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800 border-transparent"
+            }`}
+            title={
+              copilotOpen
+                ? "Hide Copilot"
+                : "Open Copilot — prompt an agent to edit the composition"
+            }
+          >
+            <svg
+              width="12"
+              height="12"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M12 2l1.5 4.5L18 8l-4.5 1.5L12 14l-1.5-4.5L6 8l4.5-1.5L12 2z" />
+              <path d="M19 14l.75 2.25L22 17l-2.25.75L19 20l-.75-2.25L16 17l2.25-.75L19 14z" />
+            </svg>
+            Copilot
+            {agentBusy && (
+              <span className="inline-block w-1.5 h-1.5 rounded-full bg-studio-accent animate-pulse" />
+            )}
+          </button>
+          <button
             onClick={() => setLeftCollapsed((v) => !v)}
             className={`h-7 w-7 flex items-center justify-center rounded-md border transition-colors ${
               !leftCollapsed
@@ -849,7 +989,14 @@ export function StudioApp() {
               });
             }}
             previewOverlay={
-              captionEditMode ? <CaptionOverlay iframeRef={previewIframeRef} /> : undefined
+              <>
+                {captionEditMode ? (
+                  <CaptionOverlay iframeRef={previewIframeRef} />
+                ) : directEditEnabled && projectId ? (
+                  <DirectEditOverlay iframeRef={previewIframeRef} projectId={projectId} />
+                ) : null}
+                {agentBusy && <AgentBusyOverlay />}
+              </>
             }
             timelineFooter={
               captionEditMode ? (
@@ -871,8 +1018,9 @@ export function StudioApp() {
           />
         </div>
 
-        {/* Right panel: Renders-only (resizable, collapsible via header Renders button) */}
-        {!rightCollapsed && (
+        {/* Right panel — Copilot takes precedence when open, then caption
+            editor, then the default Renders queue. */}
+        {(copilotOpen || !rightCollapsed) && (
           <>
             <div
               className="w-1 flex-shrink-0 bg-neutral-800 hover:bg-studio-accent cursor-col-resize transition-colors active:bg-studio-accent/80"
@@ -881,23 +1029,29 @@ export function StudioApp() {
               onPointerMove={handlePanelResizeMove}
               onPointerUp={handlePanelResizeEnd}
             />
-            <div
-              className="flex flex-col border-l border-neutral-800 bg-neutral-900 flex-shrink-0"
-              style={{ width: rightWidth }}
-            >
-              {captionEditMode ? (
-                <CaptionPropertyPanel iframeRef={previewIframeRef} />
-              ) : (
-                <RenderQueue
-                  jobs={renderQueue.jobs}
-                  projectId={projectId}
-                  onDelete={renderQueue.deleteRender}
-                  onClearCompleted={renderQueue.clearCompleted}
-                  onStartRender={(format, quality) => renderQueue.startRender(30, quality, format)}
-                  isRendering={renderQueue.isRendering}
-                />
-              )}
-            </div>
+            {copilotOpen && projectId ? (
+              <CopilotPanel projectId={projectId} width={rightWidth} />
+            ) : (
+              <div
+                className="flex flex-col border-l border-neutral-800 bg-neutral-900 flex-shrink-0"
+                style={{ width: rightWidth }}
+              >
+                {captionEditMode ? (
+                  <CaptionPropertyPanel iframeRef={previewIframeRef} />
+                ) : (
+                  <RenderQueue
+                    jobs={renderQueue.jobs}
+                    projectId={projectId}
+                    onDelete={renderQueue.deleteRender}
+                    onClearCompleted={renderQueue.clearCompleted}
+                    onStartRender={(format, quality) =>
+                      renderQueue.startRender(30, quality, format)
+                    }
+                    isRendering={renderQueue.isRendering}
+                  />
+                )}
+              </div>
+            )}
           </>
         )}
       </div>

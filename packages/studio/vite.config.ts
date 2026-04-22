@@ -82,7 +82,10 @@ function createViteAdapter(dataDir: string, server: ViteDevServer): StudioApiAda
           }
         }
       }
-      return readdirSync(dataDir, { withFileTypes: true })
+      const projectEntries = existsSync(dataDir)
+        ? readdirSync(dataDir, { withFileTypes: true })
+        : [];
+      return projectEntries
         .filter(
           (d) =>
             (d.isDirectory() || d.isSymbolicLink()) &&
@@ -342,6 +345,114 @@ function devProjectApi(): Plugin {
           "Cache-Control": "no-store",
         });
         res.end(readFileSync(runtimePath, "utf-8"));
+      });
+
+      // ── Copilot: server-side Claude agent with tool access to the
+      //    project directory. Returns a Server-Sent Events stream so the
+      //    browser can display tool calls, text deltas, and completion in
+      //    real time. Kept OUT of the Hono/studio-api pipeline because it
+      //    needs to keep the response open for the duration of the turn
+      //    and stream incrementally — not a great fit for Hono's fetch-
+      //    style handlers.
+      server.middlewares.use(async (req, res, next) => {
+        if (req.url !== "/api/copilot/stream" || req.method !== "POST") return next();
+
+        const write = (data: string) => {
+          try {
+            res.write(data);
+          } catch {
+            /* client disconnected */
+          }
+        };
+        const sendEvent = (event: string, payload: unknown) => {
+          write(`event: ${event}\n`);
+          write(`data: ${JSON.stringify(payload)}\n\n`);
+        };
+
+        try {
+          // Parse JSON body
+          const bodyChunks: Buffer[] = [];
+          req.on("data", (chunk: Buffer) => bodyChunks.push(chunk));
+          await new Promise<void>((done) => req.on("end", () => done()));
+          const rawBody = Buffer.concat(bodyChunks).toString("utf-8");
+          const body = JSON.parse(rawBody || "{}") as {
+            projectId?: string;
+            prompt?: string;
+            selectedId?: string | null;
+            history?: Array<{ role: "user" | "assistant"; content: string }>;
+            apiKey?: string;
+            model?: string;
+          };
+
+          const projectId = body.projectId;
+          const prompt = body.prompt;
+          const apiKey = body.apiKey || process.env.ANTHROPIC_API_KEY;
+
+          if (!projectId || !prompt) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "projectId and prompt are required" }));
+            return;
+          }
+          if (!apiKey) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                error:
+                  "Anthropic API key required. Set ANTHROPIC_API_KEY in the Studio environment, or provide one via the Copilot panel.",
+              }),
+            );
+            return;
+          }
+
+          const project = createViteAdapter(dataDir, server).resolveProject(projectId);
+          if (!project) {
+            res.writeHead(404, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: `project not found: ${projectId}` }));
+            return;
+          }
+
+          // Open the SSE stream.
+          res.writeHead(200, {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache, no-transform",
+            Connection: "keep-alive",
+            "X-Accel-Buffering": "no",
+          });
+
+          // Cancellation — if the client closes the connection, abort the
+          // in-flight API request.
+          const controller = new AbortController();
+          req.on("close", () => controller.abort());
+
+          // Dynamic import keeps Vite's build happy (Anthropic SDK has
+          // Node-only imports we don't want chewed up at client time).
+          const { runCopilotTurn } = await import("./src/server/copilotAgent.js");
+
+          await runCopilotTurn({
+            apiKey,
+            projectDir: project.dir,
+            projectId,
+            userPrompt: prompt,
+            selectedId: body.selectedId ?? null,
+            history: body.history ?? [],
+            model: body.model,
+            signal: controller.signal,
+            onEvent: (ev) => sendEvent(ev.type, ev),
+          });
+
+          res.end();
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          try {
+            sendEvent("error", { type: "error", message });
+            res.end();
+          } catch {
+            if (!res.headersSent) {
+              res.writeHead(500, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: message }));
+            }
+          }
+        }
       });
 
       server.middlewares.use(async (req, res, next) => {

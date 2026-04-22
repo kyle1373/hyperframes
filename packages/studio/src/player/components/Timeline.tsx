@@ -126,6 +126,11 @@ function getStyle(tag: string): TrackStyle {
   return STYLES[t] ?? DEFAULT;
 }
 
+function clampTime(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
+  return Math.max(min, Math.min(max, value));
+}
+
 /* ── Tick Generation ────────────────────────────────────────────── */
 export function generateTicks(duration: number): { major: number[]; minor: number[] } {
   if (duration <= 0 || !Number.isFinite(duration) || duration > 7200)
@@ -167,6 +172,10 @@ interface TimelineProps {
   renderClipOverlay?: (element: import("../store/playerStore").TimelineElement) => ReactNode;
   /** Called when files are dropped onto the empty timeline */
   onFileDrop?: (files: File[]) => void;
+  /** Called on pointerup after a clip drag or trim. `start`/`duration` are
+      the final values in seconds. Implementations typically persist these
+      to the source HTML as `data-start` / `data-duration` attributes. */
+  onTimingChange?: (elementId: string, start: number, duration: number) => void;
 }
 
 export const Timeline = memo(function Timeline({
@@ -175,12 +184,14 @@ export const Timeline = memo(function Timeline({
   renderClipContent,
   renderClipOverlay,
   onFileDrop,
+  onTimingChange,
 }: TimelineProps = {}) {
   const elements = usePlayerStore((s) => s.elements);
   const duration = usePlayerStore((s) => s.duration);
   const timelineReady = usePlayerStore((s) => s.timelineReady);
   const selectedElementId = usePlayerStore((s) => s.selectedElementId);
   const setSelectedElementId = usePlayerStore((s) => s.setSelectedElementId);
+  const updateElement = usePlayerStore((s) => s.updateElement);
   const zoomMode = usePlayerStore((s) => s.zoomMode);
   const manualPps = usePlayerStore((s) => s.pixelsPerSecond);
   const playheadRef = useRef<HTMLDivElement>(null);
@@ -188,6 +199,18 @@ export const Timeline = memo(function Timeline({
   const scrollRef = useRef<HTMLDivElement>(null);
   const [hoveredClip, setHoveredClip] = useState<string | null>(null);
   const isDragging = useRef(false);
+
+  // Timeline clip drag / trim state. Pointer capture is on the scroll
+  // container (same one used for ruler seeking) so the existing
+  // handlePointerMove / handlePointerUp run for every frame of the drag.
+  const timingDragRef = useRef<{
+    elementId: string;
+    mode: "move" | "trim-left" | "trim-right";
+    startPointerX: number;
+    startStart: number;
+    startDuration: number;
+    moved: boolean;
+  } | null>(null);
   // Range selection (Shift+drag)
   const [shiftHeld, setShiftHeld] = useState(false);
   useMountEffect(() => {
@@ -355,6 +378,40 @@ export const Timeline = memo(function Timeline({
         return;
       }
 
+      // Clip body or trim-edge drag — detect via data-clip-role markers.
+      // Only engage when onTimingChange is wired (i.e. parent knows how to
+      // persist the change). Otherwise we fall through to the old click-
+      // to-select behaviour.
+      if (onTimingChange) {
+        const target = e.target as HTMLElement | null;
+        const roleEl = target?.closest("[data-clip-role]") as HTMLElement | null;
+        const clipEl = target?.closest("[data-clip]") as HTMLElement | null;
+        if (roleEl && clipEl) {
+          const role = roleEl.getAttribute("data-clip-role");
+          const elementId = clipEl.getAttribute("data-element-id");
+          const element = elementId
+            ? usePlayerStore.getState().elements.find((el) => el.id === elementId)
+            : null;
+          if (element && (role === "move" || role === "trim-left" || role === "trim-right")) {
+            (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+            timingDragRef.current = {
+              elementId: element.id,
+              mode: role,
+              startPointerX: e.clientX,
+              startStart: element.start,
+              startDuration: element.duration,
+              moved: false,
+            };
+            setShowPopover(false);
+            // Don't stopPropagation — we want the existing click to still
+            // fire for simple selections. But do prevent the default text-
+            // selection drag.
+            e.preventDefault();
+            return;
+          }
+        }
+      }
+
       // Normal click on a clip — let the clip handle it
       if ((e.target as HTMLElement).closest("[data-clip]")) return;
       (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
@@ -364,10 +421,37 @@ export const Timeline = memo(function Timeline({
       setShowPopover(false);
       seekFromX(e.clientX);
     },
-    [seekFromX, pps],
+    [seekFromX, pps, onTimingChange],
   );
   const handlePointerMove = useCallback(
     (e: React.PointerEvent) => {
+      // Clip drag / trim takes priority — it lives on top of any other
+      // pointer interpretation. Pointer delta is converted to seconds
+      // using the current pps and snapped to 1/20s (50 ms) so fine-tuning
+      // is still possible but saves are clean.
+      if (timingDragRef.current) {
+        const d = timingDragRef.current;
+        const rawDx = (e.clientX - d.startPointerX) / pps;
+        // 50 ms snap — fine enough for precision, coarse enough to avoid
+        // saving 0.34756 every time.
+        const dx = Math.round(rawDx * 20) / 20;
+        if (Math.abs(dx) >= 0.01) d.moved = true;
+
+        if (d.mode === "move") {
+          const newStart = clampTime(d.startStart + dx, 0, 7200);
+          updateElement(d.elementId, { start: newStart });
+        } else if (d.mode === "trim-left") {
+          const newStart = clampTime(d.startStart + dx, 0, d.startStart + d.startDuration - 0.1);
+          const deltaStart = newStart - d.startStart;
+          const newDuration = Math.max(0.1, d.startDuration - deltaStart);
+          updateElement(d.elementId, { start: newStart, duration: newDuration });
+        } else if (d.mode === "trim-right") {
+          const newDuration = Math.max(0.1, d.startDuration + dx);
+          updateElement(d.elementId, { duration: newDuration });
+        }
+        return;
+      }
+
       if (isRangeSelecting.current) {
         const rect = scrollRef.current?.getBoundingClientRect();
         if (rect) {
@@ -383,9 +467,20 @@ export const Timeline = memo(function Timeline({
       seekFromX(e.clientX);
       autoScrollDuringDrag(e.clientX);
     },
-    [seekFromX, autoScrollDuringDrag, pps],
+    [seekFromX, autoScrollDuringDrag, pps, updateElement],
   );
   const handlePointerUp = useCallback(() => {
+    // Commit clip-timing drag if one was in flight.
+    if (timingDragRef.current) {
+      const d = timingDragRef.current;
+      timingDragRef.current = null;
+      if (d.moved) {
+        const el = usePlayerStore.getState().elements.find((x) => x.id === d.elementId);
+        if (el && onTimingChange) onTimingChange(el.id, el.start, el.duration);
+      }
+      return;
+    }
+
     if (isRangeSelecting.current) {
       isRangeSelecting.current = false;
       // Show popover if range is meaningful (> 0.2s)
@@ -400,7 +495,7 @@ export const Timeline = memo(function Timeline({
     }
     isDragging.current = false;
     cancelAnimationFrame(dragScrollRaf.current);
-  }, []);
+  }, [onTimingChange]);
 
   const tracks = useMemo(() => {
     const map = new Map<number, typeof elements>();
@@ -645,9 +740,14 @@ export const Timeline = memo(function Timeline({
                         hasCustomContent={hasCustomContent}
                         style={clipStyle}
                         isComposition={isComposition}
+                        timingEditable={Boolean(onTimingChange)}
                         onHoverStart={() => setHoveredClip(clipKey)}
                         onHoverEnd={() => setHoveredClip(null)}
                         onClick={(e) => {
+                          // If the user just finished a drag, suppress the
+                          // click-to-select so an intentional nudge doesn't
+                          // also toggle selection state.
+                          if (timingDragRef.current) return;
                           e.stopPropagation();
                           setSelectedElementId(isSelected ? null : el.id);
                         }}

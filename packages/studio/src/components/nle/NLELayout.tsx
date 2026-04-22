@@ -4,6 +4,7 @@ import { useTimelinePlayer, PlayerControls, Timeline, usePlayerStore } from "../
 import type { TimelineElement } from "../../player";
 import { NLEPreview } from "./NLEPreview";
 import { CompositionBreadcrumb, type CompositionLevel } from "./CompositionBreadcrumb";
+import { commitMutation } from "../../editor/htmlMutation";
 
 interface NLELayoutProps {
   projectId: string;
@@ -38,6 +39,15 @@ interface NLELayoutProps {
 const MIN_TIMELINE_H = 100;
 const DEFAULT_TIMELINE_H = 220;
 const MIN_PREVIEW_H = 120;
+
+/** Format a duration/offset in seconds for the `data-*` attribute. Drops
+ *  trailing zeros so round seconds stay readable ("5" not "5.000"), but
+ *  caps precision at 3 decimals to avoid `0.33333333…` noise. */
+function formatSeconds(n: number): string {
+  if (!Number.isFinite(n)) return "0";
+  const rounded = Math.round(n * 1000) / 1000;
+  return String(rounded);
+}
 
 export const NLELayout = memo(function NLELayout({
   projectId,
@@ -240,6 +250,40 @@ export const NLELayout = memo(function NLELayout({
     [projectId, compIdToSrc],
   );
 
+  // ── Clip timing persistence ────────────────────────────────────────────
+  //
+  // Timeline emits `onTimingChange(elementId, start, duration)` on pointer-
+  // up after any drag or trim. We persist those back to the source HTML as
+  // `data-start` / `data-duration` on the element with matching id.
+  //
+  // File routing: at master level the element lives in the project's
+  // root (index.html). When the user has drilled into a sub-composition,
+  // we write to that sub-composition's file instead — the breadcrumb's
+  // top id is the relative path to the sub's html file.
+  const compositionStackRef = useRef(compositionStack);
+  compositionStackRef.current = compositionStack;
+  const handleTimingChange = useCallback(
+    (elementId: string, start: number, duration: number) => {
+      const stack = compositionStackRef.current;
+      const top = stack[stack.length - 1];
+      const filePath = stack.length > 1 && top ? top.id : "index.html";
+      void commitMutation(
+        projectId,
+        {
+          type: "dataAttr",
+          id: elementId,
+          attrs: {
+            "data-start": formatSeconds(start),
+            "data-duration": formatSeconds(duration),
+          },
+        },
+        filePath,
+      ).catch((err) => console.warn("[timeline] failed to save clip timing", err));
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [projectId],
+  );
+
   // Navigate back to a specific breadcrumb level
   const handleNavigateComposition = useCallback((index: number) => {
     // When going back to master (index 0), restore the saved master position
@@ -375,6 +419,7 @@ export const NLELayout = memo(function NLELayout({
                 onSeek={seek}
                 onDrillDown={handleDrillDown}
                 renderClipContent={renderClipContent}
+                onTimingChange={handleTimingChange}
               />
             </div>
             {timelineFooter && <div className="flex-shrink-0">{timelineFooter}</div>}
