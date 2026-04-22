@@ -266,8 +266,24 @@ export async function runDrift(opts: DriftScenarioOpts): Promise<Metric[]> {
   // and p95 < 100ms, so a single bad sample legitimately gates the build.
   const maxDrift = Math.max(...allDrifts);
   const p95Drift = percentile(allDrifts, 95);
+  // Coefficient of variation (stddev / mean) is logged here as a soft signal
+  // we can eyeball in CI output. We deliberately do NOT gate on it — the
+  // baseline asserts absolute thresholds (max, p95), and the underlying
+  // distribution is heavy-tailed (most frames are sub-50ms, occasional ones
+  // spike during the 50ms media-sync interval). But CV is a useful early
+  // warning: if it climbs significantly across CI runs while max + p95 stay
+  // green, our jitter assumptions about the runtime's resync loop have
+  // shifted (e.g. if media.ts changes its 50ms `setInterval` cadence) and
+  // we should revisit the baselines before they start producing flakes.
+  // TODO(player-perf): once we have ~2 weeks of CI baseline data, decide
+  // whether to publish CV as a tracked-but-ungated metric in baseline.json
+  // alongside max + p95, or wire it into the Slack regression report.
+  const meanDrift = allDrifts.reduce((a, b) => a + b, 0) / allDrifts.length;
+  const variance = allDrifts.reduce((acc, d) => acc + (d - meanDrift) ** 2, 0) / allDrifts.length;
+  const stddev = Math.sqrt(variance);
+  const cv = meanDrift > 0 ? stddev / meanDrift : 0;
   console.log(
-    `[scenario:drift] aggregate max=${maxDrift.toFixed(2)}ms p95=${p95Drift.toFixed(2)}ms videos=${lastVideoCount} samples=${allDrifts.length} runs=${runs}`,
+    `[scenario:drift] aggregate max=${maxDrift.toFixed(2)}ms p95=${p95Drift.toFixed(2)}ms mean=${meanDrift.toFixed(2)}ms cv=${cv.toFixed(3)} videos=${lastVideoCount} samples=${allDrifts.length} runs=${runs}`,
   );
 
   return [

@@ -62,7 +62,38 @@ export type ScrubScenarioOpts = {
 const DEFAULT_FIXTURE = "10-video-grid";
 /** Targets are seconds within the composition (10s duration). */
 const SEEK_TARGETS: readonly number[] = [1.0, 7.0, 2.0, 8.0, 3.0, 9.0, 4.0, 6.0, 5.0, 0.5];
-/** Generous; postMessage round-trip + frame quantization is well under this. */
+/**
+ * Tolerance window the rAF watcher uses to decide that the iframe's reported
+ * `__player.getTime()` matches the requested seek target. 50ms = 1.5 frames at
+ * 30fps, which absorbs three sources of expected slippage:
+ *
+ *   1. **Frame quantization on the postMessage path.** `_sendControl("seek")`
+ *      converts seconds → integer frame number → seconds inside the runtime,
+ *      so e.g. a target of 1.0s on a 30fps composition lands at frame 30 →
+ *      1.000s exactly, but a target of 1.005s lands at frame 30 → still
+ *      1.000s, a 5ms quantization error baked into the API itself.
+ *   2. **Sub-frame intra-clip clock advance.** Even with the iframe paused,
+ *      between the `seek()` call landing and the next rAF tick, the runtime
+ *      may have already nudged time by a fraction of a frame as part of
+ *      finalizing the seek; `getTime()` reports the post-finalize value.
+ *   3. **Variable host load + browser jitter on CI.** GitHub runners share
+ *      cores, so a noisy neighbor can delay the rAF tick that would otherwise
+ *      register the match by tens of ms. Picking a tolerance much tighter
+ *      than this would gate against runner contention rather than player
+ *      regressions.
+ *
+ * The metric this scenario asserts is *latency to user-visible match*, not
+ * *exact equality of the reported time*, so a 50ms acceptance window is the
+ * intended behavior — but if we ever want to tighten this (e.g. to assert
+ * sub-frame precision on the inline path now that PR #397 documented it),
+ * this is the knob to turn. Configurability is deliberately deferred until
+ * we have a concrete second use case; YAGNI.
+ *
+ * TODO(player-perf): revisit this constant after P0-1b lands and we have ~2
+ * weeks of CI baseline data — if the inline-mode samples consistently cluster
+ * well below 50ms, drop this to e.g. 16ms (1 frame @ 60fps) and split the
+ * tolerance per mode (tighter for inline, current for isolated).
+ */
 const MATCH_TOLERANCE_S = 0.05;
 /** Per-seek timeout; isolated p95 in the proposal is 80ms, so 1s is huge headroom. */
 const SEEK_TIMEOUT_MS = 1_000;

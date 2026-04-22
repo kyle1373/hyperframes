@@ -43,7 +43,34 @@ const RESULTS_FILE = resolve(RESULTS_DIR, "metrics.json");
 
 type ScenarioId = "load" | "fps" | "scrub" | "drift";
 
-/** Per-scenario default `runs` value when the caller didn't pass `--runs`. */
+/**
+ * Per-scenario default `runs` value when the caller didn't pass `--runs`.
+ *
+ * Why `load` gets 5 runs and the others get 3:
+ *
+ *   - `load` reports a single p95 over `runs` measurements, so each `run` is
+ *     one sample. p95 over n=3 is mostly noise (the 95th percentile of three
+ *     numbers is just `max`), so we bump it to 5. We considered 10 — but cold
+ *     load is the slowest scenario in the shard (~2s × 5 runs × 2 fixtures =
+ *     ~20s with disk cache cleared), and going to 10 would push the load shard
+ *     past 30s of pure-measurement wall time per CI invocation.
+ *   - `fps` aggregates as `min(ratio)` over runs — 3 runs gives us a worst-
+ *     of-three signal, which is what we want for a floor metric. Adding more
+ *     runs would only make the ratio strictly smaller (more chances to catch
+ *     a stall) and shift the threshold toward false positives from runner
+ *     contention rather than real regressions.
+ *   - `scrub` and `drift` *pool* their per-run samples (10 seeks/run for
+ *     scrub, ~1500 RVFC frames/run for drift) and compute the percentile over
+ *     the pooled set. Their effective sample count for the percentile is
+ *     `runs × samples_per_run`, not `runs`, so 3 runs already gives 30+ scrub
+ *     samples and 4500+ drift samples per shard — well above the n≈30 rule of
+ *     thumb for a stable p95.
+ *
+ * TODO(player-perf): revisit `fps: 3` once we have ~2 weeks of CI baseline
+ * data — if `min(ratio)` shows >5% inter-run variance attributable to runner
+ * jitter (not real player regressions), bump to 5 and tighten the
+ * `compositionTimeAdvancementRatioMin` baseline accordingly.
+ */
 const DEFAULT_RUNS: Record<ScenarioId, number> = {
   load: 5,
   fps: 3,

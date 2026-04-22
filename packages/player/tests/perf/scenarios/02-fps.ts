@@ -1,38 +1,53 @@
 /**
- * Scenario 02: sustained playback frame rate.
+ * Scenario 02: sustained playback against the composition clock.
  *
  * Loads the 10-video-grid fixture, calls `player.play()`, then samples
- * `requestAnimationFrame` callbacks inside the iframe for ~5 seconds. GSAP's
- * ticker drives rAF continuously while the timeline is playing, so the rAF
- * cadence is a faithful proxy for the effective render frame rate of the full
- * composition (10 simultaneously-decoding videos + GSAP transform updates).
+ * `__player.getTime()` at fixed wall-clock intervals for ~5 seconds. The
+ * emitted metric is the ratio of composition-time advanced to wall-clock
+ * elapsed:
+ *
+ *   composition_time_advancement_ratio = (getTime(end) - getTime(start)) / wallSeconds
+ *
+ * This reads ~1.0 when the runtime is keeping up with its intended playback
+ * speed and falls below 1.0 when the player stalls — a slow video decoder, a
+ * blocked main thread, a GC pause, anything that prevents the composition
+ * clock from advancing at real-time. The metric is independent of the host
+ * display refresh rate by construction: both numerator and denominator are
+ * wall-clock timestamps, neither is a frame count, so a 60Hz, 120Hz, or 240Hz
+ * runner sees the same value for a healthy player.
+ *
+ * Why we replaced the previous rAF-based FPS metric:
+ *   The original implementation counted `requestAnimationFrame` ticks per
+ *   wall-clock second and asserted `fps >= 55`. On a 120Hz CI runner that
+ *   reads ~120 fps regardless of whether the composition is actually
+ *   advancing, so the gate passed even when the player was silently stalling.
+ *   See PR #400 review (jrusso1020 + miguel-heygen) for the full discussion;
+ *   this implementation follows jrusso1020's "first choice" recommendation.
  *
  * Per the proposal:
  *   Test 1: Playback frame rate (player-perf-fps)
- *     Load 10-video composition → play 5s → collect rAF tick count + dropped frames
- *     Assert: fps >= 55 (allow 8% drop from 60), dropped frames < 3
+ *     Load 10-video composition → play 5s → measure how well the player kept
+ *     up with the composition clock.
  *
  * Methodology details:
- *   - We install the rAF sampler before calling `play()` so the very first
- *     post-play frame is captured. We then wait for `__player.isPlaying()` to
- *     flip true (the parent→iframe `play` message is async via postMessage)
+ *   - We install the wall-clock sampler before calling `play()` so the very
+ *     first post-play tick is captured. We then wait for `__player.isPlaying()`
+ *     to flip true (the parent→iframe `play` message is async via postMessage)
  *     and *reset* the sample buffer, so the measurement window only contains
- *     frames produced while the runtime was actively playing the timeline.
- *   - FPS is computed as `(samples - 1) / (lastTs - firstTs in seconds)`. This
- *     is independent of wall-clock setTimeout drift — we trust the rAF
- *     timestamps because they are the same numbers the compositor saw.
- *   - A frame is "dropped" when the gap to the previous rAF callback exceeds
- *     1.5 × (1000 / TARGET_FPS) ms. With a 60Hz target that's >25ms, which
- *     matches the conventional "missed at least one vsync" definition used by
- *     Chrome DevTools.
+ *     samples taken while the runtime was actively playing the timeline.
+ *   - Sampling cadence is 100ms (10 samples/sec). That's fine-grained enough
+ *     to spot a half-second stall but coarse enough that the sampler itself
+ *     has negligible overhead. With a 5s window we collect ~50 samples; the
+ *     ratio is computed from the first and last sample's `getTime()` values.
+ *   - We use `setInterval` (not rAF) on purpose: rAF cadence is the metric we
+ *     are trying to *avoid* depending on. `setInterval` is wall-clock-driven.
  *
- * Outputs two metrics:
- *   - playback_fps_min       (higher-is-better, baseline key fpsMin)
- *   - playback_dropped_frames_max (lower-is-better, baseline key droppedFramesMax)
+ * Outputs one metric:
+ *   - composition_time_advancement_ratio_min
+ *     (higher-is-better, baseline key compositionTimeAdvancementRatioMin)
  *
- * We aggregate as `min(fps)` and `max(droppedFrames)` across runs because the
- * proposal asserts a floor on fps and a ceiling on dropped frames — the worst
- * sample is the one that matters for guarding against regressions.
+ * Aggregation: `min(ratio)` across runs because the proposal asserts a floor
+ * — the worst run is the one that gates against regressions.
  */
 
 import type { Browser, Frame, Page } from "puppeteer-core";
@@ -50,19 +65,16 @@ export type FpsScenarioOpts = {
 
 const DEFAULT_FIXTURE = "10-video-grid";
 const PLAYBACK_DURATION_MS = 5_000;
-const TARGET_FPS = 60;
-const DROPPED_FRAME_THRESHOLD_MS = (1000 / TARGET_FPS) * 1.5;
+const SAMPLE_INTERVAL_MS = 100;
 const PLAY_CONFIRM_TIMEOUT_MS = 5_000;
 const FRAME_LOOKUP_TIMEOUT_MS = 5_000;
 
 declare global {
   interface Window {
-    /** rAF timestamps collected by the sampler (DOMHighResTimeStamp ms). */
-    __perfRafSamples?: number[];
-    /** Set to false to stop the sampler at the end of the measurement window. */
-    __perfRafActive?: boolean;
-    /** Most recent rAF request id, so we can cancel cleanly. */
-    __perfRafReqId?: number;
+    /** (wallClockMs, compositionTimeSec) pairs collected by the sampler. */
+    __perfPlaySamples?: Array<{ wall: number; comp: number }>;
+    /** setInterval handle used by the sampler; cleared at the end of the window. */
+    __perfPlaySamplerHandle?: number;
     /** Hyperframes runtime player API exposed inside the composition iframe. */
     __player?: {
       play: () => void;
@@ -76,10 +88,10 @@ declare global {
 }
 
 type RunResult = {
-  fps: number;
-  droppedFrames: number;
+  ratio: number;
+  compElapsedSec: number;
+  wallElapsedSec: number;
   samples: number;
-  elapsedSec: number;
 };
 
 /**
@@ -110,19 +122,21 @@ async function runOnce(
     const { duration } = await loadHostPage(page, opts.origin, { fixture });
     const frame = await getFixtureFrame(page, fixture);
 
-    // Install the rAF sampler in the iframe context. GSAP's ticker is already
-    // hooking rAF here via the runtime; we add a sibling consumer that just
-    // records the timestamp on every paint.
-    await frame.evaluate(() => {
-      window.__perfRafSamples = [];
-      window.__perfRafActive = true;
-      const tick = (ts: number) => {
-        if (!window.__perfRafActive) return;
-        window.__perfRafSamples!.push(ts);
-        window.__perfRafReqId = requestAnimationFrame(tick);
-      };
-      window.__perfRafReqId = requestAnimationFrame(tick);
-    });
+    // Install the wall-clock sampler in the iframe context. We use setInterval
+    // because rAF cadence is exactly the host-display-dependent signal we are
+    // trying NOT to depend on; setInterval is driven by the event loop and
+    // gives us samples at fixed wall-clock cadence regardless of refresh rate.
+    await frame.evaluate((sampleIntervalMs: number) => {
+      window.__perfPlaySamples = [];
+      window.__perfPlaySamplerHandle = window.setInterval(() => {
+        const comp = window.__player?.getTime?.();
+        if (typeof comp !== "number" || !Number.isFinite(comp)) return;
+        window.__perfPlaySamples!.push({
+          wall: performance.timeOrigin + performance.now(),
+          comp,
+        });
+      }, sampleIntervalMs);
+    }, SAMPLE_INTERVAL_MS);
 
     // Issue play from the host page (parent of the iframe). The player's
     // public `play()` posts a control message into the iframe.
@@ -139,21 +153,24 @@ async function runOnce(
     });
 
     // Reset samples now that playback is confirmed running. Anything captured
-    // before this point belongs to the ramp-up window and would skew FPS down.
+    // before this point belongs to the ramp-up window (composition clock at
+    // 0, wall clock advancing) and would skew the ratio toward 0.
     await frame.evaluate(() => {
-      window.__perfRafSamples = [];
+      window.__perfPlaySamples = [];
     });
 
     // Sustain playback for the measurement window.
     await new Promise((r) => setTimeout(r, PLAYBACK_DURATION_MS));
 
-    // Stop the sampler and harvest the timestamps before pausing the runtime,
+    // Stop the sampler and harvest the samples before pausing the runtime,
     // so the pause command can't perturb the tail of the sample window.
     const samples = (await frame.evaluate(() => {
-      window.__perfRafActive = false;
-      if (window.__perfRafReqId !== undefined) cancelAnimationFrame(window.__perfRafReqId);
-      return window.__perfRafSamples ?? [];
-    })) as number[];
+      if (window.__perfPlaySamplerHandle !== undefined) {
+        clearInterval(window.__perfPlaySamplerHandle);
+        window.__perfPlaySamplerHandle = undefined;
+      }
+      return window.__perfPlaySamples ?? [];
+    })) as Array<{ wall: number; comp: number }>;
 
     await page.evaluate(() => {
       const el = document.getElementById("player") as (HTMLElement & { pause: () => void }) | null;
@@ -162,27 +179,27 @@ async function runOnce(
 
     if (samples.length < 2) {
       throw new Error(
-        `[scenario:fps] run ${idx + 1}/${total}: only ${samples.length} rAF samples captured (composition duration ${duration}s)`,
+        `[scenario:fps] run ${idx + 1}/${total}: only ${samples.length} composition-clock samples captured (composition duration ${duration}s)`,
       );
     }
 
     const first = samples[0]!;
     const last = samples[samples.length - 1]!;
-    const elapsedSec = (last - first) / 1000;
-    const fps = (samples.length - 1) / elapsedSec;
-
-    let droppedFrames = 0;
-    for (let i = 1; i < samples.length; i++) {
-      const gap = samples[i]! - samples[i - 1]!;
-      if (gap > DROPPED_FRAME_THRESHOLD_MS) droppedFrames++;
-    }
+    const wallElapsedSec = (last.wall - first.wall) / 1000;
+    const compElapsedSec = last.comp - first.comp;
+    const ratio = wallElapsedSec > 0 ? compElapsedSec / wallElapsedSec : 0;
 
     console.log(
-      `[scenario:fps] run[${idx + 1}/${total}] fps=${fps.toFixed(2)} dropped=${droppedFrames} samples=${samples.length} elapsed=${elapsedSec.toFixed(3)}s`,
+      `[scenario:fps] run[${idx + 1}/${total}] ratio=${ratio.toFixed(4)} compElapsed=${compElapsedSec.toFixed(3)}s wallElapsed=${wallElapsedSec.toFixed(3)}s samples=${samples.length}`,
     );
 
     await page.close();
-    return { fps, droppedFrames, samples: samples.length, elapsedSec };
+    return {
+      ratio,
+      compElapsedSec,
+      wallElapsedSec,
+      samples: samples.length,
+    };
   } finally {
     await ctx.close();
   }
@@ -192,41 +209,28 @@ export async function runFps(opts: FpsScenarioOpts): Promise<Metric[]> {
   const fixture = opts.fixture ?? DEFAULT_FIXTURE;
   const runs = Math.max(1, opts.runs);
   console.log(
-    `[scenario:fps] fixture=${fixture} runs=${runs} window=${PLAYBACK_DURATION_MS}ms target=${TARGET_FPS}fps droppedThreshold=${DROPPED_FRAME_THRESHOLD_MS.toFixed(2)}ms`,
+    `[scenario:fps] fixture=${fixture} runs=${runs} window=${PLAYBACK_DURATION_MS}ms sampleInterval=${SAMPLE_INTERVAL_MS}ms`,
   );
 
-  const fpsResults: number[] = [];
-  const droppedResults: number[] = [];
+  const ratios: number[] = [];
   for (let i = 0; i < runs; i++) {
     const result = await runOnce(opts, fixture, i, runs);
-    fpsResults.push(result.fps);
-    droppedResults.push(result.droppedFrames);
+    ratios.push(result.ratio);
   }
 
-  // Worst case wins for both metrics: the proposal asserts fps >= 55 and
-  // dropped frames < 3, so a single bad run should be the one that gates.
-  const fpsMin = Math.min(...fpsResults);
-  const droppedMax = Math.max(...droppedResults);
-  console.log(
-    `[scenario:fps] aggregate min fps=${fpsMin.toFixed(2)} max dropped=${droppedMax} runs=${runs}`,
-  );
+  // Worst run wins: the proposal asserts a floor on this ratio, so a single
+  // bad run (slow decoder, GC pause, host contention) is the one that gates.
+  const ratioMin = Math.min(...ratios);
+  console.log(`[scenario:fps] aggregate min ratio=${ratioMin.toFixed(4)} runs=${runs}`);
 
   return [
     {
-      name: "playback_fps_min",
-      baselineKey: "fpsMin",
-      value: fpsMin,
-      unit: "fps",
+      name: "composition_time_advancement_ratio_min",
+      baselineKey: "compositionTimeAdvancementRatioMin",
+      value: ratioMin,
+      unit: "ratio",
       direction: "higher-is-better",
-      samples: fpsResults,
-    },
-    {
-      name: "playback_dropped_frames_max",
-      baselineKey: "droppedFramesMax",
-      value: droppedMax,
-      unit: "frames",
-      direction: "lower-is-better",
-      samples: droppedResults,
+      samples: ratios,
     },
   ];
 }

@@ -31,8 +31,16 @@ export type Metric = {
 export type PerfBaseline = {
   compLoadColdP95Ms: number;
   compLoadWarmP95Ms: number;
-  fpsMin: number;
-  droppedFramesMax: number;
+  /**
+   * Floor on `(compositionTime advanced) / (wallClock elapsed)` over a sustained
+   * playback window — see packages/player/tests/perf/scenarios/02-fps.ts. A
+   * healthy player keeps up with its intended speed and reads ~1.0; values
+   * below 1.0 mean the composition clock fell behind real time, which is the
+   * actual user-visible jank we want to gate against. Refresh-rate independent
+   * by construction, so it does not saturate to display refresh on high-Hz
+   * runners the way the previous `fpsMin` did. Direction: higher-is-better.
+   */
+  compositionTimeAdvancementRatioMin: number;
   scrubLatencyP95IsolatedMs: number;
   scrubLatencyP95InlineMs: number;
   driftMaxMs: number;
