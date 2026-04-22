@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import path, { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   HF_BRIDGE_SCRIPT,
@@ -111,6 +111,43 @@ describe("isPathInside", () => {
       rmSync(rootDir, { recursive: true, force: true });
       rmSync(outsideDir, { recursive: true, force: true });
     }
+  });
+
+  describe("with path.win32 (cross-platform pinning tests)", () => {
+    // Pin Windows-path semantics on Linux/macOS CI by injecting the win32
+    // path module. Without this, accidental Unix-only assumptions (e.g. only
+    // splitting on "/") would silently regress for Windows users.
+    const win32 = { pathModule: path.win32 };
+
+    it("returns true when the child equals the parent", () => {
+      expect(isPathInside("C:\\foo", "C:\\foo", win32)).toBe(true);
+    });
+
+    it("returns true for direct children", () => {
+      expect(isPathInside("C:\\foo\\bar", "C:\\foo", win32)).toBe(true);
+    });
+
+    it("returns true for deeply nested descendants", () => {
+      expect(isPathInside("C:\\foo\\a\\b\\c.html", "C:\\foo", win32)).toBe(true);
+    });
+
+    it("rejects siblings with a shared name prefix", () => {
+      expect(isPathInside("C:\\foobar\\x", "C:\\foo", win32)).toBe(false);
+      expect(isPathInside("C:\\foo-other\\x", "C:\\foo", win32)).toBe(false);
+    });
+
+    it("rejects path-traversal attempts that escape the parent", () => {
+      expect(isPathInside("C:\\foo\\..\\etc\\passwd", "C:\\foo", win32)).toBe(false);
+    });
+
+    it("treats parents with and without trailing backslashes the same", () => {
+      expect(isPathInside("C:\\foo\\bar", "C:\\foo\\", win32)).toBe(true);
+      expect(isPathInside("C:\\foo\\bar", "C:\\foo", win32)).toBe(true);
+    });
+
+    it("rejects paths on a different drive letter", () => {
+      expect(isPathInside("D:\\foo\\bar", "C:\\foo", win32)).toBe(false);
+    });
   });
 });
 

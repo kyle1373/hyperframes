@@ -14,8 +14,19 @@ import { readFileSync, existsSync, realpathSync, statSync } from "node:fs";
 import { join, extname, resolve, sep } from "node:path";
 import { getVerifiedHyperframeRuntimeSource } from "./hyperframeRuntimeLoader.js";
 
+type PathModuleLike = {
+  resolve: (...segments: string[]) => string;
+  sep: string;
+};
+
 type IsPathInsideOptions = {
   resolveSymlinks?: boolean;
+  /**
+   * Path module used for resolution and separator comparison. Defaults to
+   * `node:path` for the running platform. Tests inject `path.win32` /
+   * `path.posix` to exercise cross-platform behavior on a single OS.
+   */
+  pathModule?: PathModuleLike;
 };
 
 /**
@@ -35,9 +46,11 @@ export function isPathInside(
   parent: string,
   options: IsPathInsideOptions = {},
 ): boolean {
-  const { resolveSymlinks = false } = options;
-  const resolvedChild = resolve(child);
-  const resolvedParent = resolve(parent);
+  const { resolveSymlinks = false, pathModule } = options;
+  const resolveFn = pathModule?.resolve ?? resolve;
+  const separator = pathModule?.sep ?? sep;
+  const resolvedChild = resolveFn(child);
+  const resolvedParent = resolveFn(parent);
   const normalizedChild =
     resolveSymlinks && existsSync(resolvedChild)
       ? realpathSync.native(resolvedChild)
@@ -47,7 +60,9 @@ export function isPathInside(
       ? realpathSync.native(resolvedParent)
       : resolvedParent;
   if (normalizedChild === normalizedParent) return true;
-  const parentWithSep = normalizedParent.endsWith(sep) ? normalizedParent : normalizedParent + sep;
+  const parentWithSep = normalizedParent.endsWith(separator)
+    ? normalizedParent
+    : normalizedParent + separator;
   return normalizedChild.startsWith(parentWithSep);
 }
 
