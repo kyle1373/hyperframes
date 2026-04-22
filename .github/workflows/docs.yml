@@ -2,14 +2,19 @@ name: Docs
 
 on:
   pull_request:
+    branches: [main]
     paths:
       - "docs/**"
       - "DOCS_GUIDELINES.md"
+      - "packages/core/schemas/**"
+      - "scripts/sync-schemas.ts"
   push:
     branches: [main]
     paths:
       - "docs/**"
       - "DOCS_GUIDELINES.md"
+      - "packages/core/schemas/**"
+      - "scripts/sync-schemas.ts"
 
 concurrency:
   group: docs-${{ github.ref }}
@@ -26,6 +31,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+
+      - name: Check schema mirror (core → docs)
+        run: npx tsx scripts/sync-schemas.ts --check
 
       - name: Validate build
         working-directory: docs

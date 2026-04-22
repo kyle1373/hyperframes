@@ -104,6 +104,31 @@ When `format: 'webm'`:
 - FFmpeg encodes with VP9 + `yuva420p` pixel format
 - Audio is encoded as Opus (instead of AAC for MP4)
 
+#### HDR Output
+
+Set `hdr: true` to enable HDR detection. The producer probes every video and image source for BT.2020 / PQ / HLG color tagging — if any HDR source is found, the output uses H.265 10-bit BT.2020 with HDR10 static metadata. SDR-only compositions are unaffected.
+
+```typescript
+const job = createRenderJob({
+  fps: 30,
+  quality: 'standard',
+  format: 'mp4',
+  hdr: true,
+});
+
+await executeRenderJob(job, './my-video', './output.mp4');
+```
+
+When `hdr: true`:
+- Sources are probed via `ffprobe`; PQ takes precedence over HLG when both are present
+- HDR videos and images are extracted as 16-bit linear-light pixels and composited natively
+- SDR DOM overlays are converted from sRGB → BT.2020 before being layered on top
+- Output uses `libx265` with `yuv420p10le` and HDR10 mastering / content-light-level metadata
+- `format` must be `'mp4'` — `'mov'` and `'webm'` fall back to SDR
+- HDR `<img>` support is **still images only**; animated HDR-tagged images use only the first frame
+
+For full details on source requirements, fallback rules, and verification, see [HDR Rendering](/guides/hdr).
+
 ### Progress Callbacks
 
 ```typescript
@@ -251,6 +276,30 @@ bun run benchmark
 ```
 
 The benchmark runs several compositions with different quality and FPS settings and reports timing for each combination.
+
+## External assets (files outside `projectDir`)
+
+A composition can reference absolute paths to assets outside the project
+directory — a local voiceover in `~/Downloads`, a shared-drive image, a
+generated fixture at an absolute path. The producer handles these by:
+
+1. **Detection.** During compilation, the HTML compiler walks every
+   `[src]` / `[href]` and every `url(...)` in `<style>`. A path that
+   resolves to a file outside `projectDir` is collected into an
+   `externalAssets` map.
+2. **Sanitised keys.** Each absolute path is converted into a safe,
+   cross-platform relative key prefixed with `hf-ext/`. Windows
+   drive-letter colons are stripped (`D:\foo\x.wav` → `hf-ext/D/foo/x.wav`)
+   so that `path.join(compileDir, key)` stays inside the compile
+   directory on every OS.
+3. **Copy + rewrite.** The orchestrator copies the file under
+   `<compileDir>/hf-ext/...` and the HTML is rewritten to point at the
+   sanitised key. The file server then serves both project-internal and
+   external assets from the same root.
+
+The containment check uses `path.relative()` rather than a hardcoded
+separator, so external assets work identically on macOS, Linux, and
+Windows. See `packages/producer/src/utils/paths.ts` for the helpers.
 
 ## Related Packages
 

@@ -4,6 +4,17 @@ import { formatTime } from "../lib/time";
 import { usePlayerStore, liveTime } from "../store/playerStore";
 
 const SPEED_OPTIONS = [0.25, 0.5, 1, 1.5, 2] as const;
+const SEEK_EDGE_SNAP_PX = 8;
+
+export function resolveSeekPercent(clientX: number, rectLeft: number, rectWidth: number): number {
+  if (!Number.isFinite(rectWidth) || rectWidth <= 0) return 0;
+  const rawPercent = (clientX - rectLeft) / rectWidth;
+  const clamped = Math.max(0, Math.min(1, rawPercent));
+  const snapThreshold = Math.min(0.5, SEEK_EDGE_SNAP_PX / rectWidth);
+  if (clamped <= snapThreshold) return 0;
+  if (clamped >= 1 - snapThreshold) return 1;
+  return clamped;
+}
 
 interface PlayerControlsProps {
   onTogglePlay: () => void;
@@ -88,7 +99,7 @@ export const PlayerControls = memo(function PlayerControls({
       const bar = seekBarRef.current;
       if (!bar || duration <= 0) return;
       const rect = bar.getBoundingClientRect();
-      const percent = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+      const percent = resolveSeekPercent(clientX, rect.left, rect.width);
       // Immediately update progress bar visuals (don't wait for liveTime round-trip)
       const pct = percent * 100;
       if (progressFillRef.current) progressFillRef.current.style.width = `${pct}%`;
@@ -98,23 +109,76 @@ export const PlayerControls = memo(function PlayerControls({
     [duration, onSeek],
   );
 
-  const handleMouseDown = useCallback(
-    (e: React.MouseEvent) => {
+  const handlePointerDown = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      // Ignore secondary mouse buttons — only primary (left click / touch /
+      // pen contact) should start a drag.
+      if (e.button !== 0) return;
       e.preventDefault();
+      // preventDefault() on pointerdown also suppresses the implicit focus
+      // transfer that click normally grants a `tabIndex=0` element — which
+      // matches native `<input type="range">` behavior, but it also means a
+      // click-then-arrow-key workflow wouldn't work. Restore focus explicitly
+      // so seeking by click and nudging by arrow keys compose naturally.
+      e.currentTarget.focus();
       isDraggingRef.current = true;
+
+      // `setPointerCapture` routes every subsequent pointermove/up to the
+      // slider element even when the pointer leaves its bounding box. Without
+      // it, fast drags on touch would lose events the moment the finger
+      // slips outside the 6 px-tall hit zone.
+      const target = e.currentTarget;
+      const pointerId = e.pointerId;
+      try {
+        target.setPointerCapture(pointerId);
+      } catch {
+        /* non-supporting browsers fall back to window listeners below */
+      }
+
       seekFromClientX(e.clientX);
 
-      const onMouseMove = (me: MouseEvent) => {
-        if (isDraggingRef.current) seekFromClientX(me.clientX);
+      const onMove = (ev: PointerEvent) => {
+        if (ev.pointerId !== pointerId) return;
+        if (isDraggingRef.current) seekFromClientX(ev.clientX);
       };
-      const onMouseUp = () => {
+      const cleanup = () => {
         isDraggingRef.current = false;
-        window.removeEventListener("mousemove", onMouseMove);
-        window.removeEventListener("mouseup", onMouseUp);
+        try {
+          target.releasePointerCapture(pointerId);
+        } catch {
+          /* Already released after the first cleanup — second invocation
+             via the window-fallback or visibility path is a no-op throw. */
+        }
+        target.removeEventListener("pointermove", onMove);
+        target.removeEventListener("pointerup", onUp);
+        target.removeEventListener("pointercancel", onUp);
+        window.removeEventListener("pointerup", onUp);
+        window.removeEventListener("pointercancel", onUp);
+        document.removeEventListener("visibilitychange", onVisibilityChange);
+        window.removeEventListener("blur", cleanup);
+      };
+      const onUp = (ev: PointerEvent) => {
+        if (ev.pointerId !== pointerId) return;
+        cleanup();
+      };
+      // iOS Safari does not reliably fire `pointercancel` when the page is
+      // backgrounded mid-drag (alt-tab, incoming call, switch apps). Without
+      // a release path the ref stays `true` until the next pointerdown — a
+      // stuck-scrubber class bug waiting to happen if anyone later gates
+      // rendering on `isDragging`. Synthesize the release on hide / blur.
+      const onVisibilityChange = () => {
+        if (document.visibilityState === "hidden") cleanup();
       };
 
-      window.addEventListener("mousemove", onMouseMove);
-      window.addEventListener("mouseup", onMouseUp);
+      target.addEventListener("pointermove", onMove);
+      target.addEventListener("pointerup", onUp);
+      target.addEventListener("pointercancel", onUp);
+      // Window-level fallback in case capture fails and the pointer release
+      // lands outside the element (rare, but defensive).
+      window.addEventListener("pointerup", onUp);
+      window.addEventListener("pointercancel", onUp);
+      document.addEventListener("visibilitychange", onVisibilityChange);
+      window.addEventListener("blur", cleanup);
     },
     [seekFromClientX],
   );
@@ -137,7 +201,13 @@ export const PlayerControls = memo(function PlayerControls({
   return (
     <div
       className="px-4 py-2 flex items-center gap-3"
-      style={{ borderTop: "1px solid rgba(255,255,255,0.04)" }}
+      style={{
+        borderTop: "1px solid rgba(255,255,255,0.04)",
+        // Add iOS safe-area inset so Safari's bottom URL bar doesn't occlude
+        // the Play button + timecode on iPhone. `env(safe-area-inset-bottom)`
+        // is 0 everywhere else, so this is a no-op on desktop.
+        paddingBottom: "calc(0.5rem + env(safe-area-inset-bottom))",
+      }}
     >
       {/* Play/Pause button */}
       <button
@@ -183,8 +253,12 @@ export const PlayerControls = memo(function PlayerControls({
         aria-valuemax={Math.round(duration)}
         aria-valuenow={0}
         className="flex-1 h-6 flex items-center cursor-pointer group"
-        style={{ touchAction: "manipulation" }}
-        onMouseDown={handleMouseDown}
+        // `touch-action: none` tells the browser we're handling every
+        // pointer gesture on this element ourselves. Without it, iOS
+        // Safari consumes horizontal swipes for its own swipe-back-to-
+        // previous-page navigation and the scrubber can't drag left.
+        style={{ touchAction: "none" }}
+        onPointerDown={handlePointerDown}
         onKeyDown={handleKeyDown}
       >
         <div

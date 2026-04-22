@@ -17,6 +17,51 @@ const MODEL_URLS: Record<string, string> = {
 const VOICES_URL =
   "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin";
 
+// Locale codes accepted by Kokoro's phonemizer (misaki for English,
+// espeak-ng for everything else). Kept as a readonly tuple so the union
+// type below stays driven by this single source.
+export const SUPPORTED_LANGS = [
+  "en-us",
+  "en-gb",
+  "es",
+  "fr-fr",
+  "hi",
+  "it",
+  "pt-br",
+  "ja",
+  "zh",
+] as const;
+
+export type SupportedLang = (typeof SUPPORTED_LANGS)[number];
+
+// Kokoro voice IDs are `<lang><gender>_<name>` — the first letter is
+// language, the second is gender. See https://github.com/hexgrad/kokoro.
+const VOICE_PREFIX_LANG: Record<string, SupportedLang> = {
+  a: "en-us", // American English
+  b: "en-gb", // British English
+  e: "es", // Spanish
+  f: "fr-fr", // French
+  h: "hi", // Hindi
+  i: "it", // Italian
+  j: "ja", // Japanese
+  p: "pt-br", // Brazilian Portuguese
+  z: "zh", // Mandarin
+};
+
+/**
+ * Infer the phonemizer language from a Kokoro voice ID prefix.
+ * Unknown prefixes fall back to `en-us` — Kokoro's text frontend is
+ * English-trained, so that's the safe default.
+ */
+export function inferLangFromVoiceId(voiceId: string): SupportedLang {
+  const first = voiceId.charAt(0).toLowerCase();
+  return VOICE_PREFIX_LANG[first] ?? "en-us";
+}
+
+export function isSupportedLang(value: string): value is SupportedLang {
+  return (SUPPORTED_LANGS as readonly string[]).includes(value);
+}
+
 // ---------------------------------------------------------------------------
 // Voices — Kokoro ships 54 voices across 8 languages. We expose a curated
 // default set and allow users to specify any valid Kokoro voice ID.
@@ -38,6 +83,10 @@ export const BUNDLED_VOICES: VoiceInfo[] = [
   { id: "bf_emma", label: "Emma", language: "en-GB", gender: "female" },
   { id: "bf_isabella", label: "Isabella", language: "en-GB", gender: "female" },
   { id: "bm_george", label: "George", language: "en-GB", gender: "male" },
+  { id: "ef_dora", label: "Dora", language: "es", gender: "female" },
+  { id: "ff_siwis", label: "Siwis", language: "fr-FR", gender: "female" },
+  { id: "jf_alpha", label: "Alpha", language: "ja", gender: "female" },
+  { id: "zf_xiaobei", label: "Xiaobei", language: "zh", gender: "female" },
 ];
 
 export const DEFAULT_VOICE = "af_heart";

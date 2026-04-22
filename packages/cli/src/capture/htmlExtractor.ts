@@ -17,22 +17,9 @@ export async function extractHtml(
 ): Promise<ExtractedHtml> {
   const settleTime = opts.settleTime ?? DEFAULT_SETTLE_TIME;
 
-  // Step 1: Trigger lazy loading by scrolling through the page
-  await page.evaluate(`(async () => {
-    var pageHeight = document.body.scrollHeight;
-    var viewportH = window.innerHeight;
-    var step = Math.floor(viewportH * 0.7);
-    for (var y = 0; y < pageHeight + viewportH; y += step) {
-      window.scrollTo(0, y);
-      await new Promise(function(r) { setTimeout(r, 200); });
-    }
-    window.scrollTo(0, pageHeight);
-    await new Promise(function(r) { setTimeout(r, 300); });
-    window.scrollTo(0, 0);
-    await new Promise(function(r) { setTimeout(r, 300); });
-  })()`);
-
-  // Re-measure after lazy load
+  // Lazy-load scroll removed — index.ts already scrolls before calling extractHtml.
+  // Images are loaded by the time we get here.
+  // Settle wait kept as buffer before DOM extraction.
   await new Promise((r) => setTimeout(r, settleTime));
 
   // Step 2: Inline external stylesheets

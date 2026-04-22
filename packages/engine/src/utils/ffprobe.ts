@@ -1,4 +1,6 @@
 import { spawn } from "child_process";
+import { readFileSync } from "fs";
+import { extname } from "path";
 
 /** Spawn ffprobe with given args, return stdout. Throws on non-zero exit or missing binary. */
 function runFfprobe(args: string[]): Promise<string> {
@@ -42,6 +44,15 @@ function parseProbeJson(stdout: string): FFProbeOutput {
 const videoMetadataCache = new Map<string, Promise<VideoMetadata>>();
 const audioMetadataCache = new Map<string, Promise<AudioMetadata>>();
 
+export interface VideoColorSpace {
+  /** Color transfer characteristics, e.g. "bt709", "smpte2084", "arib-std-b67" */
+  colorTransfer: string;
+  /** Color primaries, e.g. "bt709", "bt2020" */
+  colorPrimaries: string;
+  /** Color matrix/space, e.g. "bt709", "bt2020nc" */
+  colorSpace: string;
+}
+
 export interface VideoMetadata {
   durationSeconds: number;
   width: number;
@@ -51,6 +62,8 @@ export interface VideoMetadata {
   hasAudio: boolean;
   /** True when r_frame_rate and avg_frame_rate differ significantly (>10%), indicating variable frame rate. */
   isVFR: boolean;
+  /** Color space info from the video stream. Null if ffprobe didn't report it. */
+  colorSpace: VideoColorSpace | null;
 }
 
 export interface AudioMetadata {
@@ -70,6 +83,9 @@ interface FFProbeStream {
   avg_frame_rate?: string;
   sample_rate?: string;
   channels?: number;
+  color_transfer?: string;
+  color_primaries?: string;
+  color_space?: string;
 }
 
 interface FFProbeFormat {
@@ -80,6 +96,107 @@ interface FFProbeFormat {
 interface FFProbeOutput {
   streams: FFProbeStream[];
   format: FFProbeFormat;
+}
+
+interface StillImageMetadata {
+  width: number;
+  height: number;
+  colorSpace: VideoColorSpace | null;
+}
+
+function crc32(buf: Buffer): number {
+  let crc = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) {
+    crc ^= buf[i] ?? 0;
+    for (let bit = 0; bit < 8; bit++) {
+      const mask = -(crc & 1);
+      crc = (crc >>> 1) ^ (0xedb88320 & mask);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+export function extractPngMetadataFromBuffer(buf: Buffer): StillImageMetadata | null {
+  if (
+    buf.length < 8 ||
+    buf[0] !== 137 ||
+    buf[1] !== 80 ||
+    buf[2] !== 78 ||
+    buf[3] !== 71 ||
+    buf[4] !== 13 ||
+    buf[5] !== 10 ||
+    buf[6] !== 26 ||
+    buf[7] !== 10
+  ) {
+    return null;
+  }
+
+  let width = 0;
+  let height = 0;
+  let seenIdat = false;
+  let pos = 8;
+  while (pos + 12 <= buf.length) {
+    const chunkLen = buf.readUInt32BE(pos);
+    const chunkType = buf.toString("ascii", pos + 4, pos + 8);
+    if (pos + 12 + chunkLen > buf.length) return null;
+    const chunkData = buf.subarray(pos + 8, pos + 8 + chunkLen);
+    const chunkCrc = buf.readUInt32BE(pos + 8 + chunkLen);
+    const chunkBytes = Buffer.concat([Buffer.from(chunkType, "ascii"), chunkData]);
+    if (crc32(chunkBytes) !== chunkCrc) return null;
+
+    if (chunkType === "IHDR" && chunkLen >= 8) {
+      width = buf.readUInt32BE(pos + 8);
+      height = buf.readUInt32BE(pos + 12);
+    }
+
+    if (chunkType === "IDAT") {
+      seenIdat = true;
+    }
+
+    if (chunkType === "cICP" && chunkLen === 4 && !seenIdat) {
+      const primariesCode = chunkData[0] ?? 0;
+      const transferCode = chunkData[1] ?? 0;
+      const matrixCode = chunkData[2] ?? 0;
+
+      return {
+        width,
+        height,
+        colorSpace: {
+          colorPrimaries:
+            primariesCode === 9
+              ? "bt2020"
+              : primariesCode === 1
+                ? "bt709"
+                : `unknown-${primariesCode}`,
+          colorTransfer:
+            transferCode === 16
+              ? "smpte2084"
+              : transferCode === 18
+                ? "arib-std-b67"
+                : transferCode === 1
+                  ? "bt709"
+                  : `unknown-${transferCode}`,
+          colorSpace:
+            matrixCode === 9 ? "bt2020nc" : matrixCode === 0 ? "gbr" : `unknown-${matrixCode}`,
+        },
+      };
+    }
+
+    if (chunkType === "IEND") break;
+    pos += 12 + chunkLen;
+  }
+
+  return width > 0 && height > 0 ? { width, height, colorSpace: null } : null;
+}
+
+function extractStillImageMetadata(filePath: string): StillImageMetadata | null {
+  if (extname(filePath).toLowerCase() !== ".png") return null;
+
+  try {
+    return extractPngMetadataFromBuffer(readFileSync(filePath));
+  } catch {
+    return null;
+  }
 }
 
 function parseFrameRate(frameRateStr: string | undefined): number {
@@ -98,18 +215,40 @@ export async function extractVideoMetadata(filePath: string): Promise<VideoMetad
   if (cached) return cached;
 
   const probePromise = (async (): Promise<VideoMetadata> => {
-    const stdout = await runFfprobe([
-      "-v",
-      "quiet",
-      "-print_format",
-      "json",
-      "-show_format",
-      "-show_streams",
-      filePath,
-    ]);
-    const output = parseProbeJson(stdout);
-    const videoStream = output.streams.find((s) => s.codec_type === "video");
-    if (!videoStream) throw new Error("[FFmpeg] No video stream found");
+    const stillImageMeta = extractStillImageMetadata(filePath);
+
+    let output: FFProbeOutput | null = null;
+    try {
+      const stdout = await runFfprobe([
+        "-v",
+        "quiet",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+        filePath,
+      ]);
+      output = parseProbeJson(stdout);
+    } catch (error) {
+      if (!stillImageMeta) throw error;
+    }
+
+    const videoStream = output?.streams.find((s) => s.codec_type === "video");
+    if (!videoStream) {
+      if (stillImageMeta) {
+        return {
+          durationSeconds: 0,
+          width: stillImageMeta.width,
+          height: stillImageMeta.height,
+          fps: 0,
+          videoCodec: "png",
+          hasAudio: false,
+          isVFR: false,
+          colorSpace: stillImageMeta.colorSpace,
+        };
+      }
+      throw new Error("[FFmpeg] No video stream found");
+    }
 
     const rFps = parseFrameRate(videoStream.r_frame_rate);
     const avgFps = parseFrameRate(videoStream.avg_frame_rate);
@@ -117,14 +256,24 @@ export async function extractVideoMetadata(filePath: string): Promise<VideoMetad
     // VFR: r_frame_rate (max/nominal) differs from avg_frame_rate (actual average) by >10%
     const isVFR = rFps > 0 && avgFps > 0 && Math.abs(rFps - avgFps) / Math.max(rFps, avgFps) > 0.1;
 
+    const colorTransfer = videoStream.color_transfer || "";
+    const colorPrimaries = videoStream.color_primaries || "";
+    const colorSpaceVal = videoStream.color_space || "";
+    const ffprobeColorSpace =
+      colorTransfer || colorPrimaries || colorSpaceVal
+        ? { colorTransfer, colorPrimaries, colorSpace: colorSpaceVal }
+        : null;
+    const colorSpace = ffprobeColorSpace ?? stillImageMeta?.colorSpace ?? null;
+
     return {
-      durationSeconds: output.format.duration ? parseFloat(output.format.duration) : 0,
-      width: videoStream.width || 0,
-      height: videoStream.height || 0,
+      durationSeconds: output?.format.duration ? parseFloat(output.format.duration) : 0,
+      width: videoStream.width || stillImageMeta?.width || 0,
+      height: videoStream.height || stillImageMeta?.height || 0,
       fps,
       videoCodec: videoStream.codec_name || "unknown",
-      hasAudio: output.streams.some((s) => s.codec_type === "audio"),
+      hasAudio: output?.streams.some((s) => s.codec_type === "audio") ?? false,
       isVFR,
+      colorSpace,
     };
   })();
 

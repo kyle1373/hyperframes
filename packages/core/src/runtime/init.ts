@@ -1190,6 +1190,7 @@ export function initSandboxRuntimeModular(): void {
       playing: state.isPlaying,
       playbackRate: state.playbackRate,
       outputMuted: state.mediaOutputMuted,
+      userMuted: state.bridgeMuted,
       onAutoplayBlocked: () => {
         if (state.mediaAutoplayBlockedPosted) return;
         state.mediaAutoplayBlockedPosted = true;
@@ -1373,6 +1374,8 @@ export function initSandboxRuntimeModular(): void {
     setTimeline: (timeline) => {
       state.capturedTimeline = timeline;
     },
+    getTimelineRegistry: () =>
+      (window.__timelines ?? {}) as Record<string, RuntimeTimelineLike | undefined>,
     getIsPlaying: () => state.isPlaying,
     setIsPlaying: (playing) => {
       state.isPlaying = playing;
@@ -1474,10 +1477,10 @@ export function initSandboxRuntimeModular(): void {
   }
 
   state.deterministicAdapters = [
+    createWaapiAdapter(),
     createCssAdapter({
       resolveStartSeconds: (element) => resolveStartForElement(element, 0),
     }),
-    createWaapiAdapter(),
     createLottieAdapter(),
     createThreeAdapter(),
     createGsapAdapter({ getTimeline: () => state.capturedTimeline }),

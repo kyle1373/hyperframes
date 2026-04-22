@@ -9,6 +9,63 @@ export function createCssAdapter(params?: {
     basePlayState: string;
   }> = [];
 
+  const getAnimationsForElement = (el: HTMLElement): Animation[] => {
+    if (typeof el.getAnimations !== "function") return [];
+    try {
+      return el.getAnimations();
+    } catch {
+      return [];
+    }
+  };
+
+  const seekAnimations = (animations: Animation[], timeMs: number) => {
+    for (const animation of animations) {
+      try {
+        animation.currentTime = timeMs;
+      } catch {
+        // ignore animations that reject currentTime writes
+      }
+      try {
+        animation.pause();
+      } catch {
+        // infinite unresolved animations can throw on pause before currentTime sticks
+      }
+    }
+  };
+
+  const playAnimations = (animations: Animation[]) => {
+    for (const animation of animations) {
+      try {
+        animation.play();
+      } catch {
+        // ignore animation edge-cases
+      }
+    }
+  };
+
+  const pauseAnimations = (animations: Animation[]) => {
+    for (const animation of animations) {
+      try {
+        animation.pause();
+      } catch {
+        // ignore animation edge-cases
+      }
+    }
+  };
+
+  const restoreInlineStyles = (entry: (typeof entries)[number]) => {
+    if (entry.baseDelay) {
+      entry.el.style.animationDelay = entry.baseDelay;
+    } else {
+      entry.el.style.removeProperty("animation-delay");
+    }
+    if (entry.basePlayState) {
+      entry.el.style.animationPlayState = entry.basePlayState;
+    } else {
+      entry.el.style.removeProperty("animation-play-state");
+    }
+  };
+
   return {
     name: "css",
     discover: () => {
@@ -32,16 +89,33 @@ export function createCssAdapter(params?: {
         const start = params?.resolveStartSeconds
           ? params.resolveStartSeconds(entry.el)
           : Number.parseFloat(entry.el.getAttribute("data-start") ?? "0") || 0;
-        const localTime = Math.max(0, time - start);
+        const localTimeMs = Math.max(0, time - start) * 1000;
+        const animations = getAnimationsForElement(entry.el);
+        if (animations.length > 0) {
+          seekAnimations(animations, localTimeMs);
+          continue;
+        }
+
+        // Fallback for environments without WAAPI-backed CSS animation handles.
         entry.el.style.animationPlayState = "paused";
-        entry.el.style.animationDelay = `-${localTime.toFixed(3)}s`;
+        entry.el.style.animationDelay = `-${(localTimeMs / 1000).toFixed(3)}s`;
       }
     },
     pause: () => {
       for (const entry of entries) {
         if (!entry.el.isConnected) continue;
-        entry.el.style.animationPlayState = entry.basePlayState || "paused";
-        if (entry.baseDelay) entry.el.style.animationDelay = entry.baseDelay;
+        const animations = getAnimationsForElement(entry.el);
+        if (animations.length > 0) {
+          pauseAnimations(animations);
+        }
+        restoreInlineStyles(entry);
+      }
+    },
+    play: () => {
+      for (const entry of entries) {
+        if (!entry.el.isConnected) continue;
+        restoreInlineStyles(entry);
+        playAnimations(getAnimationsForElement(entry.el));
       }
     },
     revert: () => {

@@ -1,13 +1,15 @@
 // TimelineClip — Visual clip component for the NLE timeline.
 //
-// Drag + trim: the clip body and its two edge handles carry
-// `data-clip-role` attributes ("move" | "trim-left" | "trim-right").
-// Timeline.tsx detects these on pointerdown, captures the pointer on the
-// scroll container, and drives the drag from there so the click/double-
-// click handlers keep working for simple selections.
+// Drag + trim: the clip body receives pointer events to initiate a move,
+// and each edge exposes a dedicated handle that calls `onResizeStart`
+// to initiate a trim. Timeline.tsx owns the pointer capture and drives
+// the preview/commit lifecycle.
 
 import { memo, type ReactNode } from "react";
+import type { TimelineTrackStyle } from "./timelineTheme";
 import type { TimelineElement } from "../store/playerStore";
+import { defaultTimelineTheme, getClipHandleOpacity, type TimelineTheme } from "./timelineTheme";
+import { getTimelineEditCapabilities } from "./timelineEditing";
 
 interface TimelineClipProps {
   el: TimelineElement;
@@ -15,19 +17,19 @@ interface TimelineClipProps {
   clipY: number;
   isSelected: boolean;
   isHovered: boolean;
+  isDragging?: boolean;
   hasCustomContent: boolean;
-  style: { clip: string; label: string };
+  theme?: TimelineTheme;
+  trackStyle: TimelineTrackStyle;
   isComposition: boolean;
   onHoverStart: () => void;
   onHoverEnd: () => void;
+  onPointerDown?: (e: React.PointerEvent) => void;
+  onResizeStart?: (edge: "start" | "end", e: React.PointerEvent) => void;
   onClick: (e: React.MouseEvent) => void;
   onDoubleClick: (e: React.MouseEvent) => void;
-  /** When true, render left/right trim handles and mark the body for drag. */
-  timingEditable?: boolean;
   children?: ReactNode;
 }
-
-const HANDLE_W = 6;
 
 export const TimelineClip = memo(function TimelineClip({
   el,
@@ -35,48 +37,63 @@ export const TimelineClip = memo(function TimelineClip({
   clipY,
   isSelected,
   isHovered,
+  isDragging = false,
   hasCustomContent,
-  style,
+  theme = defaultTimelineTheme,
+  trackStyle,
   isComposition,
   onHoverStart,
   onHoverEnd,
+  onPointerDown,
+  onResizeStart,
   onClick,
   onDoubleClick,
-  timingEditable = false,
   children,
 }: TimelineClipProps) {
   const leftPx = el.start * pps;
   const widthPx = Math.max(el.duration * pps, 4);
-  const showHandles = timingEditable && widthPx >= 18;
+  const handleOpacity = getClipHandleOpacity({ isHovered, isSelected, isDragging });
+  const borderColor = isSelected
+    ? theme.clipBorderActive
+    : isHovered
+      ? theme.clipBorderHover
+      : theme.clipBorder;
+  const boxShadow = isDragging
+    ? theme.clipShadowDragging
+    : isSelected
+      ? theme.clipShadowActive
+      : isHovered
+        ? theme.clipShadowHover
+        : theme.clipShadow;
+  const capabilities = getTimelineEditCapabilities(el);
+  const showHandles = handleOpacity > 0.01;
 
   return (
     <div
       data-clip="true"
-      data-clip-role={timingEditable ? "move" : undefined}
-      data-element-id={el.id}
-      className={hasCustomContent ? "absolute" : "absolute flex items-center"}
+      className={
+        hasCustomContent ? "absolute overflow-hidden" : "absolute flex items-center overflow-hidden"
+      }
       style={{
         left: leftPx,
         width: widthPx,
         top: clipY,
         bottom: clipY,
-        borderRadius: 5,
-        backgroundColor: hasCustomContent ? (isComposition ? "#111" : style.clip) : style.clip,
+        borderRadius: theme.clipRadius,
+        background: isSelected
+          ? `linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0)), linear-gradient(120deg, ${trackStyle.accent}22, transparent 28%), ${theme.clipBackgroundActive}`
+          : `linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0)), linear-gradient(120deg, ${trackStyle.accent}1e, transparent 28%), ${theme.clipBackground}`,
         backgroundImage:
           isComposition && !hasCustomContent
-            ? `repeating-linear-gradient(135deg, transparent, transparent 3px, rgba(255,255,255,0.08) 3px, rgba(255,255,255,0.08) 6px)`
+            ? `repeating-linear-gradient(135deg, transparent, transparent 3px, rgba(255,255,255,0.05) 3px, rgba(255,255,255,0.05) 6px)`
             : undefined,
-        border: isSelected
-          ? `2px solid rgba(255,255,255,0.9)`
-          : `1px solid rgba(255,255,255,${isHovered ? 0.3 : 0.15})`,
-        boxShadow: isSelected
-          ? `0 0 0 1px ${style.clip}, 0 2px 8px rgba(0,0,0,0.4)`
-          : isHovered
-            ? "0 1px 4px rgba(0,0,0,0.3)"
-            : "none",
-        transition: "border-color 120ms, box-shadow 120ms",
-        zIndex: isSelected ? 10 : isHovered ? 5 : 1,
-        cursor: timingEditable ? "grab" : "default",
+        border: `1px solid ${borderColor}`,
+        boxShadow,
+        transition:
+          "border-color 120ms ease-out, box-shadow 140ms ease-out, background 140ms ease-out",
+        zIndex: isDragging ? 20 : isSelected ? 10 : isHovered ? 5 : 1,
+        cursor: capabilities.canMove ? "grab" : "default",
+        transform: isDragging ? "translateY(-1px)" : undefined,
       }}
       title={
         isComposition
@@ -85,58 +102,83 @@ export const TimelineClip = memo(function TimelineClip({
       }
       onPointerEnter={onHoverStart}
       onPointerLeave={onHoverEnd}
+      onPointerDown={onPointerDown}
       onClick={onClick}
       onDoubleClick={onDoubleClick}
     >
-      {/* Left trim handle — visible on hover/selection, interactive always.
-          Width = HANDLE_W so users have a real grab target without
-          visually stealing space from the clip body. */}
-      {showHandles && (
+      <div
+        aria-hidden="true"
+        role="presentation"
+        onPointerDown={(e) => onResizeStart?.("start", e)}
+        style={{
+          position: "absolute",
+          left: 0,
+          top: 0,
+          bottom: 0,
+          width: 18,
+          opacity: showHandles && capabilities.canTrimStart ? 1 : 0,
+          pointerEvents: onResizeStart && capabilities.canTrimStart ? "auto" : "none",
+          zIndex: 4,
+          transition: "opacity 120ms ease-out",
+          cursor: "col-resize",
+          background:
+            showHandles && capabilities.canTrimStart
+              ? `linear-gradient(90deg, ${trackStyle.accent}4d 0%, ${trackStyle.accent}22 42%, transparent 100%)`
+              : "transparent",
+        }}
+      >
         <div
-          data-clip-role="trim-left"
-          title={`Trim start · now ${el.start.toFixed(2)}s`}
           style={{
             position: "absolute",
-            left: 0,
-            top: 0,
-            bottom: 0,
-            width: HANDLE_W,
-            cursor: "ew-resize",
-            background:
-              isSelected || isHovered
-                ? "linear-gradient(90deg, rgba(255,255,255,0.85), rgba(255,255,255,0.15))"
-                : "rgba(255,255,255,0.0)",
-            transition: "background 120ms",
-            zIndex: 20,
-            touchAction: "none",
+            left: 6,
+            top: 7,
+            bottom: 7,
+            width: 3,
+            borderRadius: 999,
+            background: theme.handleColor,
+            boxShadow: `0 0 0 1px ${trackStyle.accent}38, 0 0 12px ${trackStyle.accent}18`,
+            opacity: handleOpacity,
+            pointerEvents: "none",
           }}
         />
-      )}
-
+      </div>
+      <div
+        aria-hidden="true"
+        role="presentation"
+        onPointerDown={(e) => onResizeStart?.("end", e)}
+        style={{
+          position: "absolute",
+          right: 0,
+          top: 0,
+          bottom: 0,
+          width: 18,
+          opacity: showHandles ? 1 : 0,
+          pointerEvents: onResizeStart && capabilities.canTrimEnd ? "auto" : "none",
+          zIndex: 4,
+          transition: "opacity 120ms ease-out",
+          cursor: "col-resize",
+          background:
+            showHandles && capabilities.canTrimEnd
+              ? `linear-gradient(270deg, ${trackStyle.accent}4d 0%, ${trackStyle.accent}22 42%, transparent 100%)`
+              : "transparent",
+        }}
+      >
+        <div
+          style={{
+            position: "absolute",
+            right: 6,
+            top: 7,
+            bottom: 7,
+            width: 3,
+            borderRadius: 999,
+            background: theme.handleColor,
+            boxShadow: `0 0 0 1px ${trackStyle.accent}38, 0 0 12px ${trackStyle.accent}18`,
+            opacity: handleOpacity,
+            pointerEvents: "none",
+          }}
+        />
+      </div>
       {children}
-
-      {/* Right trim handle */}
-      {showHandles && (
-        <div
-          data-clip-role="trim-right"
-          title={`Trim end · now ${(el.start + el.duration).toFixed(2)}s (dur ${el.duration.toFixed(2)}s)`}
-          style={{
-            position: "absolute",
-            right: 0,
-            top: 0,
-            bottom: 0,
-            width: HANDLE_W,
-            cursor: "ew-resize",
-            background:
-              isSelected || isHovered
-                ? "linear-gradient(270deg, rgba(255,255,255,0.85), rgba(255,255,255,0.15))"
-                : "rgba(255,255,255,0.0)",
-            transition: "background 120ms",
-            zIndex: 20,
-            touchAction: "none",
-          }}
-        />
-      )}
     </div>
   );
 });

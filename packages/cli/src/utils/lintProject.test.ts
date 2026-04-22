@@ -326,6 +326,146 @@ describe("audio_src_not_found", () => {
   });
 });
 
+describe("multiple_root_compositions", () => {
+  it("fires when two HTML files have data-composition-id", () => {
+    const project = makeProject(validHtml());
+    writeFileSync(
+      join(project.dir, "scaffold.html"),
+      '<div data-composition-id="scaffold" data-width="1920" data-height="1080" data-duration="10"></div>',
+    );
+    const { totalErrors, results } = lintProject(project);
+    const finding = results[0]?.result.findings.find(
+      (f) => f.code === "multiple_root_compositions",
+    );
+    expect(finding).toBeDefined();
+    expect(finding?.severity).toBe("error");
+    expect(finding?.message).toContain("scaffold.html");
+    expect(totalErrors).toBeGreaterThan(0);
+  });
+
+  it("does NOT fire with a single root composition", () => {
+    const project = makeProject(validHtml());
+    const { results } = lintProject(project);
+    const finding = results[0]?.result.findings.find(
+      (f) => f.code === "multiple_root_compositions",
+    );
+    expect(finding).toBeUndefined();
+  });
+
+  it("ignores HTML files without data-composition-id", () => {
+    const project = makeProject(validHtml());
+    writeFileSync(join(project.dir, "readme.html"), "<html><body>Not a composition</body></html>");
+    const { results } = lintProject(project);
+    const finding = results[0]?.result.findings.find(
+      (f) => f.code === "multiple_root_compositions",
+    );
+    expect(finding).toBeUndefined();
+  });
+});
+
+describe("duplicate_audio_track", () => {
+  it("detects overlapping audio with attributes in any order", () => {
+    // The original scaffold bug: data-start BEFORE data-track-index
+    const html = `<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080" data-duration="30">
+    <audio id="narration" data-start="0" data-duration="28" data-track-index="0" src="narration.wav">
+    <audio id="bg" src="bg.wav" data-track-index="0" data-start="5" data-duration="20">
+  </div>
+  <script>window.__timelines = window.__timelines || {}; window.__timelines["main"] = gsap.timeline({ paused: true });</script>
+</body></html>`;
+    const project = makeProject(html);
+    const { results } = lintProject(project);
+    const finding = results[0]?.result.findings.find((f) => f.code === "duplicate_audio_track");
+    expect(finding).toBeDefined();
+    expect(finding?.severity).toBe("warning");
+  });
+
+  it("does NOT fire for non-overlapping audio on the same track", () => {
+    const html = `<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080" data-duration="20">
+    <audio id="a" src="a.wav" data-track-index="0" data-start="0" data-duration="10">
+    <audio id="b" src="b.wav" data-track-index="0" data-start="10" data-duration="10">
+  </div>
+  <script>window.__timelines = window.__timelines || {}; window.__timelines["main"] = gsap.timeline({ paused: true });</script>
+</body></html>`;
+    const project = makeProject(html);
+    const { results } = lintProject(project);
+    const finding = results[0]?.result.findings.find((f) => f.code === "duplicate_audio_track");
+    expect(finding).toBeUndefined();
+  });
+
+  it("does NOT fire for audio on different tracks", () => {
+    const html = `<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080" data-duration="20">
+    <audio id="a" src="a.wav" data-track-index="0" data-start="0" data-duration="20">
+    <audio id="b" src="b.wav" data-track-index="1" data-start="5" data-duration="10">
+  </div>
+  <script>window.__timelines = window.__timelines || {}; window.__timelines["main"] = gsap.timeline({ paused: true });</script>
+</body></html>`;
+    const project = makeProject(html);
+    const { results } = lintProject(project);
+    const finding = results[0]?.result.findings.find((f) => f.code === "duplicate_audio_track");
+    expect(finding).toBeUndefined();
+  });
+
+  it("deduplicates same audio found in root + sub-composition", () => {
+    const project = makeProject(validHtmlWithAudio(), {
+      "scene.html": validHtmlWithAudio("scene"),
+    });
+    writeFileSync(join(project.dir, "song.mp3"), "fake");
+    const { results } = lintProject(project);
+    const finding = results[0]?.result.findings.find((f) => f.code === "duplicate_audio_track");
+    expect(finding).toBeUndefined();
+  });
+
+  it("detects overlap when data-duration is missing (Infinity fallback)", () => {
+    const html = `<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080" data-duration="30">
+    <audio id="a" src="a.wav" data-track-index="0" data-start="0" data-duration="20">
+    <audio id="b" src="b.wav" data-track-index="0" data-start="15">
+  </div>
+  <script>window.__timelines = window.__timelines || {}; window.__timelines["main"] = gsap.timeline({ paused: true });</script>
+</body></html>`;
+    const project = makeProject(html);
+    const { results } = lintProject(project);
+    const finding = results[0]?.result.findings.find((f) => f.code === "duplicate_audio_track");
+    expect(finding).toBeDefined();
+  });
+
+  it("formats Infinity end times as 'end' without crashing", () => {
+    const html = `<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080" data-duration="30">
+    <audio id="a" src="a.wav" data-track-index="0" data-start="0">
+    <audio id="b" src="b.wav" data-track-index="0" data-start="5">
+  </div>
+  <script>window.__timelines = window.__timelines || {}; window.__timelines["main"] = gsap.timeline({ paused: true });</script>
+</body></html>`;
+    const project = makeProject(html);
+    const { results } = lintProject(project);
+    const finding = results[0]?.result.findings.find((f) => f.code === "duplicate_audio_track");
+    expect(finding).toBeDefined();
+    expect(finding?.message).toContain("end");
+    expect(finding?.message).not.toContain("Infinity");
+  });
+
+  it("finds audio across multiple HTML sources (g-flag regression)", () => {
+    const project = makeProject(validHtmlWithAudio(), {
+      "scene.html": `<html><body>
+  <div data-composition-id="scene" data-width="1920" data-height="1080">
+    <audio id="overlap" src="music.wav" data-track-index="0" data-start="5" data-duration="20">
+  </div>
+  <script>window.__timelines = window.__timelines || {}; window.__timelines["scene"] = gsap.timeline({ paused: true });</script>
+</body></html>`,
+    });
+    writeFileSync(join(project.dir, "song.mp3"), "fake");
+    writeFileSync(join(project.dir, "music.wav"), "fake");
+    const { results } = lintProject(project);
+    const finding = results[0]?.result.findings.find((f) => f.code === "duplicate_audio_track");
+    // song.mp3@0 (from validHtmlWithAudio, no data-duration → Infinity) and music.wav@5-25 overlap
+    expect(finding).toBeDefined();
+  });
+});
+
 describe("shouldBlockRender", () => {
   it("default: does not block on errors", () => {
     expect(shouldBlockRender(false, false, 5, 0)).toBe(false);

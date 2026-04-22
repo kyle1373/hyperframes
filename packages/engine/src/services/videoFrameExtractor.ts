@@ -10,7 +10,9 @@ import { existsSync, mkdirSync, readdirSync, rmSync } from "fs";
 import { join } from "path";
 import { parseHTML } from "linkedom";
 import { extractVideoMetadata, type VideoMetadata } from "../utils/ffprobe.js";
+import { isHdrColorSpace as isHdrColorSpaceUtil } from "../utils/hdr.js";
 import { downloadToTemp, isHttpUrl } from "../utils/urlDownloader.js";
+import { runFfmpeg } from "../utils/runFfmpeg.js";
 import { DEFAULT_CONFIG, type EngineConfig } from "../config.js";
 
 export interface VideoElement {
@@ -95,6 +97,48 @@ export function parseVideoElements(html: string): VideoElement[] {
   return videos;
 }
 
+export interface ImageElement {
+  id: string;
+  src: string;
+  start: number;
+  end: number;
+}
+
+export function parseImageElements(html: string): ImageElement[] {
+  const images: ImageElement[] = [];
+  const { document } = parseHTML(html);
+
+  const imgEls = document.querySelectorAll("img[src]");
+  let autoIdCounter = 0;
+  for (const el of imgEls) {
+    const src = el.getAttribute("src");
+    if (!src) continue;
+
+    const id = el.getAttribute("id") || `hf-img-${autoIdCounter++}`;
+    if (!el.getAttribute("id")) {
+      el.setAttribute("id", id);
+    }
+
+    const startAttr = el.getAttribute("data-start");
+    const endAttr = el.getAttribute("data-end");
+    const durationAttr = el.getAttribute("data-duration");
+
+    const start = startAttr ? parseFloat(startAttr) : 0;
+    let end = 0;
+    if (endAttr) {
+      end = parseFloat(endAttr);
+    } else if (durationAttr) {
+      end = start + parseFloat(durationAttr);
+    } else {
+      end = Infinity;
+    }
+
+    images.push({ id, src, start, end });
+  }
+
+  return images;
+}
+
 export async function extractVideoFramesRange(
   videoPath: string,
   videoId: string,
@@ -114,18 +158,28 @@ export async function extractVideoFramesRange(
   const framePattern = `frame_%05d.${format}`;
   const outputPattern = join(videoOutputDir, framePattern);
 
-  const args: string[] = [
-    "-ss",
-    String(startTime),
-    "-i",
-    videoPath,
-    "-t",
-    String(duration),
-    "-vf",
-    `fps=${fps}`,
-    "-q:v",
-    format === "jpg" ? String(Math.ceil((100 - quality) / 3)) : "0",
-  ];
+  // When extracting from HDR source, tone-map to SDR in FFmpeg rather than
+  // letting Chrome's uncontrollable tone-mapper handle it (which washes out).
+  // macOS: VideoToolbox hardware decoder does HDR→SDR natively on Apple Silicon.
+  // Linux: zscale filter (when available) or colorspace filter as fallback.
+  const isHdr = isHdrColorSpaceUtil(metadata.colorSpace);
+  const isMacOS = process.platform === "darwin";
+
+  const args: string[] = [];
+  if (isHdr && isMacOS) {
+    args.push("-hwaccel", "videotoolbox");
+  }
+  args.push("-ss", String(startTime), "-i", videoPath, "-t", String(duration));
+
+  const vfFilters: string[] = [];
+  if (isHdr && isMacOS) {
+    // VideoToolbox tone-maps during decode; force output to bt709 SDR format
+    vfFilters.push("format=nv12");
+  }
+  vfFilters.push(`fps=${fps}`);
+  args.push("-vf", vfFilters.join(","));
+
+  args.push("-q:v", format === "jpg" ? String(Math.ceil((100 - quality) / 3)) : "0");
   if (format === "png") args.push("-compression_level", "6");
   args.push("-y", outputPattern);
 
@@ -195,6 +249,109 @@ export async function extractVideoFramesRange(
   });
 }
 
+/**
+ * Convert an SDR video to HDR color space (HLG / BT.2020) so it can be
+ * composited alongside HDR content without looking washed out.
+ *
+ * Uses zscale for color space conversion with a nominal peak luminance of
+ * 600 nits — high enough that SDR content doesn't appear too dark next to
+ * HDR, matching the approach used by HeyGen's Rio pipeline.
+ */
+async function convertSdrToHdr(
+  inputPath: string,
+  outputPath: string,
+  signal?: AbortSignal,
+  config?: Partial<Pick<EngineConfig, "ffmpegProcessTimeout">>,
+): Promise<void> {
+  const timeout = config?.ffmpegProcessTimeout ?? DEFAULT_CONFIG.ffmpegProcessTimeout;
+
+  const args = [
+    "-i",
+    inputPath,
+    "-vf",
+    "colorspace=all=bt2020:iall=bt709:range=tv",
+    "-color_primaries",
+    "bt2020",
+    "-color_trc",
+    "arib-std-b67",
+    "-colorspace",
+    "bt2020nc",
+    "-c:v",
+    "libx264",
+    "-preset",
+    "fast",
+    "-crf",
+    "16",
+    "-c:a",
+    "copy",
+    "-y",
+    outputPath,
+  ];
+
+  const result = await runFfmpeg(args, { signal, timeout });
+  if (!result.success) {
+    throw new Error(
+      `SDR→HDR conversion failed (exit ${result.exitCode}): ${result.stderr.slice(-300)}`,
+    );
+  }
+}
+
+/**
+ * Re-encode a VFR (variable frame rate) video segment to CFR so the downstream
+ * fps filter can extract frames reliably. Screen recordings, phone videos, and
+ * some webcams emit irregular timestamps that cause two failure modes:
+ *   1. Output has fewer frames than expected (e.g. -ss 3 -t 4 produces 90
+ *      frames instead of 120 @ 30fps). FrameLookupTable.getFrameAtTime then
+ *      returns null for late timestamps and the caller freezes on the last
+ *      valid frame.
+ *   2. Large duplicate-frame runs where source PTS don't land on target
+ *      timestamps.
+ *
+ * Only the [startTime, startTime+duration] window is re-encoded, so long
+ * recordings aren't fully transcoded when only a short clip is used.
+ */
+async function convertVfrToCfr(
+  inputPath: string,
+  outputPath: string,
+  targetFps: number,
+  startTime: number,
+  duration: number,
+  signal?: AbortSignal,
+  config?: Partial<Pick<EngineConfig, "ffmpegProcessTimeout">>,
+): Promise<void> {
+  const timeout = config?.ffmpegProcessTimeout ?? DEFAULT_CONFIG.ffmpegProcessTimeout;
+
+  const args = [
+    "-ss",
+    String(startTime),
+    "-i",
+    inputPath,
+    "-t",
+    String(duration),
+    "-fps_mode",
+    "cfr",
+    "-r",
+    String(targetFps),
+    "-c:v",
+    "libx264",
+    "-preset",
+    "fast",
+    "-crf",
+    "18",
+    "-c:a",
+    "copy",
+    "-y",
+    outputPath,
+  ];
+
+  const result = await runFfmpeg(args, { signal, timeout });
+  if (!result.success) {
+    throw new Error(
+      `VFR→CFR conversion failed (exit ${result.exitCode}): ${result.stderr.slice(-300)}`,
+    );
+  }
+}
+
 export async function extractAllVideoFrames(
   videos: VideoElement[],
   baseDir: string,
@@ -208,30 +365,116 @@ export async function extractAllVideoFrames(
   const errors: Array<{ videoId: string; error: string }> = [];
   let totalFramesExtracted = 0;
 
-  // Process videos in parallel for better performance
+  // Phase 1: Resolve paths and download remote videos
+  const resolvedVideos: Array<{ video: VideoElement; videoPath: string }> = [];
+  for (const video of videos) {
+    if (signal?.aborted) break;
+    try {
+      let videoPath = video.src;
+      if (!videoPath.startsWith("/") && !isHttpUrl(videoPath)) {
+        const fromCompiled = compiledDir ? join(compiledDir, videoPath) : null;
+        videoPath =
+          fromCompiled && existsSync(fromCompiled) ? fromCompiled : join(baseDir, videoPath);
+      }
+
+      if (isHttpUrl(videoPath)) {
+        const downloadDir = join(options.outputDir, "_downloads");
+        mkdirSync(downloadDir, { recursive: true });
+        videoPath = await downloadToTemp(videoPath, downloadDir);
+      }
+
+      if (!existsSync(videoPath)) {
+        errors.push({ videoId: video.id, error: `Video file not found: ${videoPath}` });
+        continue;
+      }
+      resolvedVideos.push({ video, videoPath });
+    } catch (err) {
+      errors.push({ videoId: video.id, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  // Phase 2: Probe color spaces and normalize if mixed HDR/SDR
+  const videoColorSpaces = await Promise.all(
+    resolvedVideos.map(async ({ videoPath }) => {
+      const metadata = await extractVideoMetadata(videoPath);
+      return metadata.colorSpace;
+    }),
+  );
+
+  const hasAnyHdr = videoColorSpaces.some(isHdrColorSpaceUtil);
+  if (hasAnyHdr) {
+    const convertDir = join(options.outputDir, "_hdr_normalized");
+    mkdirSync(convertDir, { recursive: true });
+
+    for (let i = 0; i < resolvedVideos.length; i++) {
+      if (signal?.aborted) break;
+      const cs = videoColorSpaces[i] ?? null;
+      if (!isHdrColorSpaceUtil(cs)) {
+        // SDR video in a mixed timeline — convert to HDR color space
+        const entry = resolvedVideos[i];
+        if (!entry) continue;
+        const convertedPath = join(convertDir, `${entry.video.id}_hdr.mp4`);
+        try {
+          await convertSdrToHdr(entry.videoPath, convertedPath, signal, config);
+          entry.videoPath = convertedPath;
+        } catch (err) {
+          errors.push({
+            videoId: entry.video.id,
+            error: `SDR→HDR conversion failed: ${err instanceof Error ? err.message : String(err)}`,
+          });
+        }
+      }
+    }
+  }
+
+  // Phase 2b: Re-encode VFR inputs to CFR so the fps filter in Phase 3 produces
+  // the expected frame count. Only the used segment is transcoded.
+  const vfrNormDir = join(options.outputDir, "_vfr_normalized");
+  for (let i = 0; i < resolvedVideos.length; i++) {
+    if (signal?.aborted) break;
+    const entry = resolvedVideos[i];
+    if (!entry) continue;
+    const metadata = await extractVideoMetadata(entry.videoPath);
+    if (!metadata.isVFR) continue;
+
+    let segDuration = entry.video.end - entry.video.start;
+    if (!Number.isFinite(segDuration) || segDuration <= 0) {
+      const sourceRemaining = metadata.durationSeconds - entry.video.mediaStart;
+      segDuration = sourceRemaining > 0 ? sourceRemaining : metadata.durationSeconds;
+    }
+
+    mkdirSync(vfrNormDir, { recursive: true });
+    const normalizedPath = join(vfrNormDir, `${entry.video.id}_cfr.mp4`);
+    try {
+      await convertVfrToCfr(
+        entry.videoPath,
+        normalizedPath,
+        options.fps,
+        entry.video.mediaStart,
+        segDuration,
+        signal,
+        config,
+      );
+      entry.videoPath = normalizedPath;
+      // Segment-scoped re-encode starts the new file at t=0, so downstream
+      // extraction must seek from 0, not the original mediaStart. Shallow-copy
+      // to avoid mutating the caller's VideoElement.
+      entry.video = { ...entry.video, mediaStart: 0 };
+    } catch (err) {
+      errors.push({
+        videoId: entry.video.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  // Phase 3: Extract frames (parallel)
   const results = await Promise.all(
-    videos.map(async (video) => {
+    resolvedVideos.map(async ({ video, videoPath }) => {
       if (signal?.aborted) {
         throw new Error("Video frame extraction cancelled");
       }
       try {
-        let videoPath = video.src;
-        if (!videoPath.startsWith("/") && !isHttpUrl(videoPath)) {
-          const fromCompiled = compiledDir ? join(compiledDir, videoPath) : null;
-          videoPath =
-            fromCompiled && existsSync(fromCompiled) ? fromCompiled : join(baseDir, videoPath);
-        }
-
-        if (isHttpUrl(videoPath)) {
-          const downloadDir = join(options.outputDir, "_downloads");
-          mkdirSync(downloadDir, { recursive: true });
-          videoPath = await downloadToTemp(videoPath, downloadDir);
-        }
-
-        if (!existsSync(videoPath)) {
-          return { error: { videoId: video.id, error: `Video file not found: ${videoPath}` } };
-        }
-
         let videoDuration = video.end - video.start;
 
         // Fallback: if no data-duration/data-end was specified (end is Infinity or 0),

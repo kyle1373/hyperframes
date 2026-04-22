@@ -37,6 +37,103 @@ const MIME_TYPES: Record<string, string> = {
   ".otf": "font/otf",
 };
 
+const VIRTUAL_TIME_SHIM = String.raw`(function() {
+  if (window.__HF_VIRTUAL_TIME__) return;
+
+  var virtualNowMs = 0;
+  var rafId = 1;
+  var rafQueue = [];
+  var OriginalDate = Date;
+  var originalSetTimeout = window.setTimeout.bind(window);
+  var originalClearTimeout = window.clearTimeout.bind(window);
+  var originalSetInterval = window.setInterval.bind(window);
+  var originalClearInterval = window.clearInterval.bind(window);
+  var originalRequestAnimationFrame = window.requestAnimationFrame
+    ? window.requestAnimationFrame.bind(window)
+    : null;
+  var originalCancelAnimationFrame = window.cancelAnimationFrame
+    ? window.cancelAnimationFrame.bind(window)
+    : null;
+
+  function flushAnimationFrame() {
+    if (!rafQueue.length) return;
+    var current = rafQueue.slice();
+    rafQueue.length = 0;
+    for (var i = 0; i < current.length; i++) {
+      var entry = current[i];
+      if (entry.cancelled) continue;
+      try {
+        entry.callback(virtualNowMs);
+      } catch {}
+    }
+  }
+
+  function VirtualDate() {
+    var args = Array.prototype.slice.call(arguments);
+    if (!(this instanceof VirtualDate)) {
+      return OriginalDate.apply(null, args.length ? args : [virtualNowMs]);
+    }
+    var instance = args.length ? new (Function.prototype.bind.apply(OriginalDate, [null].concat(args)))() : new OriginalDate(virtualNowMs);
+    Object.setPrototypeOf(instance, VirtualDate.prototype);
+    return instance;
+  }
+
+  VirtualDate.prototype = OriginalDate.prototype;
+  Object.setPrototypeOf(VirtualDate, OriginalDate);
+  VirtualDate.now = function() { return virtualNowMs; };
+  VirtualDate.parse = OriginalDate.parse.bind(OriginalDate);
+  VirtualDate.UTC = OriginalDate.UTC.bind(OriginalDate);
+
+  try {
+    Object.defineProperty(window, "Date", {
+      configurable: true,
+      writable: true,
+      value: VirtualDate,
+    });
+  } catch {}
+
+  if (window.performance && typeof window.performance.now === "function") {
+    try {
+      Object.defineProperty(window.performance, "now", {
+        configurable: true,
+        value: function() { return virtualNowMs; },
+      });
+    } catch {}
+  }
+
+  window.requestAnimationFrame = function(callback) {
+    if (typeof callback !== "function") return 0;
+    var entry = { id: rafId++, callback: callback, cancelled: false };
+    rafQueue.push(entry);
+    return entry.id;
+  };
+  window.cancelAnimationFrame = function(id) {
+    for (var i = 0; i < rafQueue.length; i++) {
+      if (rafQueue[i].id === id) {
+        rafQueue[i].cancelled = true;
+      }
+    }
+  };
+
+  window.__HF_VIRTUAL_TIME__ = {
+    originalSetTimeout: originalSetTimeout,
+    originalClearTimeout: originalClearTimeout,
+    originalSetInterval: originalSetInterval,
+    originalClearInterval: originalClearInterval,
+    originalRequestAnimationFrame: originalRequestAnimationFrame,
+    originalCancelAnimationFrame: originalCancelAnimationFrame,
+    seekToTime: function(nextTimeMs) {
+      var safeTimeMs = Math.max(0, Number(nextTimeMs) || 0);
+      virtualNowMs = safeTimeMs;
+      flushAnimationFrame();
+      return virtualNowMs;
+    },
+    getTime: function() {
+      return virtualNowMs;
+    },
+  };
+})();`;
+
 /**
  * Render mode extension -- adds renderSeek() for frame-accurate seeking
  * without media sync (videos are replaced with frame images during render).
@@ -56,6 +153,10 @@ const RENDER_SEEK_OFFSET_FRACTION = Math.max(
 );
 
 const RENDER_MODE_SCRIPT = `(function() {
+  var __realSetTimeout =
+    window.__HF_VIRTUAL_TIME__ && typeof window.__HF_VIRTUAL_TIME__.originalSetTimeout === "function"
+      ? window.__HF_VIRTUAL_TIME__.originalSetTimeout
+      : window.setTimeout.bind(window);
   var __seekMode = ${JSON.stringify(RENDER_SEEK_MODE)};
   var __seekDiagnostics = ${RENDER_SEEK_DIAGNOSTICS ? "true" : "false"};
   var __seekStep = ${RENDER_SEEK_STEP};
@@ -149,45 +250,108 @@ const RENDER_MODE_SCRIPT = `(function() {
         window.__renderReady = true;
         return;
       }
-      setTimeout(waitForPlayer, 50);
+      __realSetTimeout(waitForPlayer, 50);
       return;
     }
     if (installMediaFallbackPlayer()) {
       return;
     }
-    setTimeout(waitForPlayer, 50);
+    __realSetTimeout(waitForPlayer, 50);
   }
   waitForPlayer();
 })();`;
 
 /**
+ * Early stub: ensures `window.__hf` exists *before* any user `<script>` in
+ * `<body>` executes. Without this, libraries that opportunistically write to
+ * `__hf` during page-script execution (notably `@hyperframes/shader-transitions`,
+ * which writes the active transition map to `__hf.transitions` inside its
+ * `init()` call) silently no-op because `__hf` hasn't been created yet — the
+ * full bridge script is injected at end-of-body and runs *after* user scripts.
+ *
+ * Injected at the very start of `<head>` so it runs before all other scripts.
+ */
+const HF_EARLY_STUB = `(function() {
+  if (typeof window === "undefined") return;
+  if (!window.__hf) window.__hf = {};
+})();`;
+
+/**
  * Bridge script: maps window.__player (Hyperframe runtime) → window.__hf (engine protocol).
  * Injected after RENDER_MODE_SCRIPT so the engine's frameCapture can find window.__hf.
+ *
+ * This script *patches* the existing __hf object rather than replacing it, so
+ * fields written during page-script execution (e.g. transitions metadata from
+ * @hyperframes/shader-transitions) are preserved through to engine query time.
  */
 const HF_BRIDGE_SCRIPT = `(function() {
+  var __realSetInterval =
+    window.__HF_VIRTUAL_TIME__ && typeof window.__HF_VIRTUAL_TIME__.originalSetInterval === "function"
+      ? window.__HF_VIRTUAL_TIME__.originalSetInterval
+      : window.setInterval.bind(window);
+  var __realClearInterval =
+    window.__HF_VIRTUAL_TIME__ && typeof window.__HF_VIRTUAL_TIME__.originalClearInterval === "function"
+      ? window.__HF_VIRTUAL_TIME__.originalClearInterval
+      : window.clearInterval.bind(window);
   function getDeclaredDuration() {
     var root = document.querySelector('[data-composition-id]');
     if (!root) return 0;
     var d = Number(root.getAttribute('data-duration'));
     return Number.isFinite(d) && d > 0 ? d : 0;
   }
+  function seekSameOriginChildFrames(frameWindow, nextTimeMs) {
+    var frames;
+    try {
+      frames = frameWindow.frames;
+    } catch (_error) {
+      return;
+    }
+    if (!frames || typeof frames.length !== "number") return;
+    for (var i = 0; i < frames.length; i++) {
+      var childWindow = null;
+      try {
+        childWindow = frames[i];
+        if (!childWindow || childWindow === frameWindow) continue;
+        if (
+          childWindow.__HF_VIRTUAL_TIME__ &&
+          typeof childWindow.__HF_VIRTUAL_TIME__.seekToTime === "function"
+        ) {
+          childWindow.__HF_VIRTUAL_TIME__.seekToTime(nextTimeMs);
+        }
+      } catch (_error) {
+        continue;
+      }
+      seekSameOriginChildFrames(childWindow, nextTimeMs);
+    }
+  }
   function bridge() {
     var p = window.__player;
     if (!p || typeof p.renderSeek !== "function" || typeof p.getDuration !== "function") {
       return false;
     }
-    window.__hf = {
-      get duration() {
+    var hf = window.__hf || {};
+    Object.defineProperty(hf, "duration", {
+      configurable: true,
+      enumerable: true,
+      get: function() {
         var d = p.getDuration();
         return d > 0 ? d : getDeclaredDuration();
       },
-      seek: function(t) { p.renderSeek(t); },
+    });
+    hf.seek = function(t) {
+      p.renderSeek(t);
+      var nextTimeMs = (Math.max(0, Number(t) || 0)) * 1000;
+      if (window.__HF_VIRTUAL_TIME__ && typeof window.__HF_VIRTUAL_TIME__.seekToTime === "function") {
+        window.__HF_VIRTUAL_TIME__.seekToTime(nextTimeMs);
+      }
+      seekSameOriginChildFrames(window, nextTimeMs);
     };
+    window.__hf = hf;
     return true;
   }
   if (bridge()) return;
-  var iv = setInterval(function() {
-    if (bridge()) clearInterval(iv);
+  var iv = __realSetInterval(function() {
+    if (bridge()) __realClearInterval(iv);
   }, 50);
 })();`;
 
@@ -226,7 +390,7 @@ function stripEmbeddedRuntimeScripts(html: string): string {
   return html.replace(scriptRe, (block) => (shouldStrip(block) ? "" : block));
 }
 
-function injectScriptsIntoHtml(
+export function injectScriptsIntoHtml(
   html: string,
   headScripts: string[],
   bodyScripts: string[],
@@ -261,10 +425,24 @@ function injectScriptsIntoHtml(
   return html;
 }
 
+export function injectScriptsAtHeadStart(html: string, scripts: string[]): string {
+  if (scripts.length === 0) return html;
+  const headTags = scripts.map((src) => `<script>${src}</script>`).join("\n");
+  if (html.includes("<head")) {
+    return html.replace(/<head\b[^>]*>/i, (match) => `${match}\n${headTags}`);
+  }
+  if (html.includes("<body")) {
+    return html.replace("<body", () => `${headTags}\n<body`);
+  }
+  return headTags + "\n" + html;
+}
+
 export interface FileServerOptions {
   projectDir: string;
   compiledDir?: string;
   port?: number;
+  /** Scripts injected into <head> of every served HTML file before authored scripts. */
+  preHeadScripts?: string[];
   /** Scripts injected into <head> of index.html. Default: verified Hyperframe runtime. */
   headScripts?: string[];
   /** Scripts injected before </body> of index.html. Default: render mode extension. */
@@ -282,6 +460,13 @@ export interface FileServerHandle {
 export function createFileServer(options: FileServerOptions): Promise<FileServerHandle> {
   const { projectDir, compiledDir, port = 0, stripEmbeddedRuntime = true } = options;
 
+  // HF_EARLY_STUB must run before *any* page script so libraries that write
+  // to window.__hf during page-script execution (e.g. shader-transitions
+  // populating __hf.transitions) find it already defined. The full bridge in
+  // bodyScripts later upgrades this stub with `seek` / `duration` once the
+  // Hyperframe runtime's __player is ready, while preserving any fields
+  // already written.
+  const preHeadScripts = [HF_EARLY_STUB, ...(options.preHeadScripts ?? [])];
   // Default scripts: Hyperframe runtime in <head>, render mode in </body>
   const headScripts = options.headScripts ?? [getVerifiedHyperframeRuntimeSource()];
   const bodyScripts = options.bodyScripts ?? [RENDER_MODE_SCRIPT, HF_BRIDGE_SCRIPT];
@@ -313,9 +498,13 @@ export function createFileServer(options: FileServerOptions): Promise<FileServer
     if (ext === ".html") {
       const rawHtml = readFileSync(filePath, "utf-8");
       const isIndex = relativePath === "index.html";
-      const html = isIndex
-        ? injectScriptsIntoHtml(rawHtml, headScripts, bodyScripts, stripEmbeddedRuntime)
-        : rawHtml;
+      let html = rawHtml;
+      if (preHeadScripts.length > 0) {
+        html = injectScriptsAtHeadStart(html, preHeadScripts);
+      }
+      html = isIndex
+        ? injectScriptsIntoHtml(html, headScripts, bodyScripts, stripEmbeddedRuntime)
+        : html;
       return c.text(html, 200, { "Content-Type": contentType });
     }
 
@@ -353,3 +542,5 @@ export function createFileServer(options: FileServerOptions): Promise<FileServer
     });
   });
 }
+
+export { HF_BRIDGE_SCRIPT, HF_EARLY_STUB, VIRTUAL_TIME_SHIM };

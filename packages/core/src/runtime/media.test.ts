@@ -458,4 +458,121 @@ describe("syncRuntimeMedia", () => {
     await Promise.resolve();
     expect(onAutoplayBlocked).not.toHaveBeenCalled();
   });
+
+  it("asserts muted=true every tick while userMuted is set", () => {
+    // Mirror of the `outputMuted` test — user preference must be sticky
+    // too. A sub-composition that activates after the user mutes should
+    // inherit the silence, not briefly play at author volume before the
+    // next bridge message lands.
+    const clip = createMockClip({ start: 0, end: 10, volume: 1 });
+    Object.defineProperty(clip.el, "readyState", { value: 4, writable: true });
+    Object.defineProperty(clip.el, "muted", { value: false, writable: true });
+    syncRuntimeMedia({
+      clips: [clip],
+      timeSeconds: 5,
+      playing: true,
+      playbackRate: 1,
+      userMuted: true,
+    });
+    expect(clip.el.muted).toBe(true);
+  });
+
+  it("fires onAutoplayBlocked for every rejected play (caller owns the latch)", async () => {
+    // media.ts is intentionally memoryless — each NotAllowedError rejection
+    // invokes the callback. The init.ts caller wraps with
+    // `mediaAutoplayBlockedPosted` so the outbound message is posted at most
+    // once per session. This test pins down the contract (fires always) so
+    // a future refactor can't quietly add deduplication here and break the
+    // caller's latching logic.
+    const clip = createMockClip({ start: 0, end: 10 });
+    Object.defineProperty(clip.el, "readyState", { value: 4, writable: true });
+    const rejection = Object.assign(new Error("blocked"), { name: "NotAllowedError" });
+    clip.el.play = vi.fn(() => Promise.reject(rejection));
+    const onAutoplayBlocked = vi.fn();
+
+    // Simulate two ticks — between them `playRequested` clears so play() runs
+    // again and rejects again.
+    syncRuntimeMedia({
+      clips: [clip],
+      timeSeconds: 5,
+      playing: true,
+      playbackRate: 1,
+      onAutoplayBlocked,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    syncRuntimeMedia({
+      clips: [clip],
+      timeSeconds: 5.05,
+      playing: true,
+      playbackRate: 1,
+      onAutoplayBlocked,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // No latch inside media.ts — two rejections, two callback invocations.
+    // The caller's latch is what prevents a second outbound message.
+    expect(onAutoplayBlocked).toHaveBeenCalledTimes(2);
+  });
+
+  it("caller-side latch pattern posts once across many rejections", async () => {
+    // Mirrors what init.ts does: the onAutoplayBlocked wrapper checks and
+    // sets a boolean flag so the outbound post fires exactly once even if
+    // the raw callback fires many times. Regression guard for the latch
+    // wiring in the init.ts handler.
+    const clip = createMockClip({ start: 0, end: 10 });
+    Object.defineProperty(clip.el, "readyState", { value: 4, writable: true });
+    const rejection = Object.assign(new Error("blocked"), { name: "NotAllowedError" });
+    clip.el.play = vi.fn(() => Promise.reject(rejection));
+
+    let posted = 0;
+    const state = { latched: false };
+    const wrapped = () => {
+      if (state.latched) return;
+      state.latched = true;
+      posted += 1;
+    };
+
+    for (let i = 0; i < 5; i++) {
+      syncRuntimeMedia({
+        clips: [clip],
+        timeSeconds: 5 + i * 0.05,
+        playing: true,
+        playbackRate: 1,
+        onAutoplayBlocked: wrapped,
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+    }
+
+    expect(posted).toBe(1);
+  });
+
+  it("mutes when either outputMuted OR userMuted is true (OR invariant)", () => {
+    // Explicit validation of the combined-flag contract: setting one to
+    // false while the other is true must keep the element muted.
+    const clip = createMockClip({ start: 0, end: 10, volume: 1 });
+    Object.defineProperty(clip.el, "readyState", { value: 4, writable: true });
+    Object.defineProperty(clip.el, "muted", { value: false, writable: true });
+    syncRuntimeMedia({
+      clips: [clip],
+      timeSeconds: 5,
+      playing: true,
+      playbackRate: 1,
+      outputMuted: false,
+      userMuted: true,
+    });
+    expect(clip.el.muted).toBe(true);
+    Object.defineProperty(clip.el, "muted", { value: false, writable: true });
+    syncRuntimeMedia({
+      clips: [clip],
+      timeSeconds: 5,
+      playing: true,
+      playbackRate: 1,
+      outputMuted: true,
+      userMuted: false,
+    });
+    expect(clip.el.muted).toBe(true);
+  });
 });

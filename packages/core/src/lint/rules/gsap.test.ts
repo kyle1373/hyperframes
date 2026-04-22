@@ -142,6 +142,42 @@ describe("GSAP rules", () => {
     expect(finding).toBeUndefined();
   });
 
+  it("does NOT require a local GSAP script for sub-compositions", () => {
+    const html = `<template id="intro-template">
+  <div data-composition-id="intro" data-width="1920" data-height="1080">
+    <div class="title">Hello</div>
+    <script>
+      window.__timelines = window.__timelines || {};
+      const tl = gsap.timeline({ paused: true });
+      tl.from(".title", { opacity: 0, duration: 1 });
+      window.__timelines["intro"] = tl;
+    </script>
+  </div>
+</template>`;
+
+    const result = lintHyperframeHtml(html, { isSubComposition: true });
+    const finding = result.findings.find((f) => f.code === "missing_gsap_script");
+    expect(finding).toBeUndefined();
+  });
+
+  it("does NOT require a local GSAP script when a template composition is linted in isolation", () => {
+    const html = `<template id="intro-template">
+  <div data-composition-id="intro" data-width="1920" data-height="1080">
+    <div class="title">Hello</div>
+    <script>
+      window.__timelines = window.__timelines || {};
+      const tl = gsap.timeline({ paused: true });
+      tl.from(".title", { opacity: 0, duration: 1 });
+      window.__timelines["intro"] = tl;
+    </script>
+  </div>
+</template>`;
+
+    const result = lintHyperframeHtml(html, { filePath: "compositions/intro.html" });
+    const finding = result.findings.find((f) => f.code === "missing_gsap_script");
+    expect(finding).toBeUndefined();
+  });
+
   it("ERRORS when GSAP animates visibility on a clip element", () => {
     const html = `
 <html><body>
@@ -543,6 +579,32 @@ describe("GSAP rules", () => {
 </body></html>`;
     const result = lintHyperframeHtml(html);
     const finding = result.findings.find((f) => f.code === "gsap_infinite_repeat");
+    expect(finding).toBeUndefined();
+  });
+
+  it("does NOT report overlapping_gsap_tweens when an object-target tween is interleaved (regression)", () => {
+    // Regression: a non-DOM-targeting tween like `tl.to({ _: 0 }, …)` (used to
+    // anchor timeline duration) was matched by the regex but skipped by the
+    // parser, drifting the index and making the second tween "see" the first
+    // tween's selector — producing a phantom self-overlap warning.
+    const html = `
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080">
+    <div id="a" class="clip" data-start="0" data-duration="5" data-track-index="0"></div>
+    <div id="b" class="clip" data-start="0" data-duration="5" data-track-index="1"></div>
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js"></script>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    tl.to({ _: 0 }, { _: 1, duration: 5, ease: "none" }, 0);
+    tl.to("#a", { opacity: 1, duration: 0.5 }, 0);
+    tl.to("#b", { opacity: 1, duration: 0.5 }, 1);
+    window.__timelines["c1"] = tl;
+  </script>
+</body></html>`;
+    const result = lintHyperframeHtml(html);
+    const finding = result.findings.find((f) => f.code === "overlapping_gsap_tweens");
     expect(finding).toBeUndefined();
   });
 

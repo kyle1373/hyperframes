@@ -52,7 +52,14 @@ function extractGsapWindows(script: string): GsapWindow[] {
   let index = 0;
   while ((match = methodPattern.exec(script)) !== null && index < parsed.animations.length) {
     const raw = match[0];
-    const meta = parseGsapWindowMeta(match[1] ?? "", match[2] ?? "");
+    const args = match[2] ?? "";
+    // Skip calls whose first argument is not a quoted selector (e.g. object
+    // targets like `tl.to({ _: 0 }, …)` used to anchor timeline duration).
+    // `parseGsapScript` ignores those, so we must too — otherwise the regex
+    // match index drifts ahead of `parsed.animations[index]` and every
+    // subsequent window picks up the wrong animation's selector/position.
+    if (!/^\s*["']/.test(args)) continue;
+    const meta = parseGsapWindowMeta(match[1] ?? "", args);
     const animation = parsed.animations[index];
     index += 1;
     if (!animation) continue;
@@ -425,11 +432,13 @@ export const gsapRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
   },
 
   // missing_gsap_script
-  ({ scripts }) => {
+  ({ scripts, rawSource, options }) => {
     const allScriptTexts = scripts.filter((s) => !/\bsrc\s*=/.test(s.attrs)).map((s) => s.content);
     const allScriptSrcs = scripts
       .map((s) => readAttr(`<script ${s.attrs}>`, "src") || "")
       .filter(Boolean);
+    const canInheritGsapFromHost =
+      options.isSubComposition || rawSource.trimStart().toLowerCase().startsWith("<template");
 
     const usesGsap = allScriptTexts.some((t) =>
       /gsap\.(to|from|fromTo|timeline|set|registerPlugin)\b/.test(t),
@@ -448,7 +457,7 @@ export const gsapRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
         (t.length > 5000 && /\bgsap\b/i.test(t)),
     );
 
-    if (!usesGsap || hasGsapScript || hasInlineGsap) return [];
+    if (!usesGsap || hasGsapScript || hasInlineGsap || canInheritGsapFromHost) return [];
     return [
       {
         code: "missing_gsap_script",

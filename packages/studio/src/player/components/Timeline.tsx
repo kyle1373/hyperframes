@@ -1,9 +1,29 @@
-import { useRef, useMemo, useCallback, useState, memo, type ReactNode } from "react";
-import { usePlayerStore, liveTime } from "../store/playerStore";
+import { useRef, useMemo, useCallback, useState, useEffect, memo, type ReactNode } from "react";
+import {
+  usePlayerStore,
+  liveTime,
+  type TimelineElement,
+  type ZoomMode,
+} from "../store/playerStore";
 import { useMountEffect } from "../../hooks/useMountEffect";
 import { formatTime } from "../lib/time";
 import { TimelineClip } from "./TimelineClip";
 import { EditPopover } from "./EditModal";
+import {
+  buildTimelineElementAgentPrompt,
+  getTimelineEditCapabilities,
+  resolveTimelineAutoScroll,
+  resolveTimelineMove,
+  resolveTimelineResize,
+} from "./timelineEditing";
+import {
+  defaultTimelineTheme,
+  getRenderedTimelineElement,
+  getTimelineTrackStyle,
+  type TimelineTrackStyle,
+  type TimelineTheme,
+} from "./timelineTheme";
+import { getTimelinePixelsPerSecond } from "./timelineZoom";
 
 /* ── Layout ─────────────────────────────────────────────────────── */
 const GUTTER = 32;
@@ -11,17 +31,7 @@ const TRACK_H = 72;
 const RULER_H = 24;
 const CLIP_Y = 3; // vertical inset inside track
 
-/* ── Vibrant Color System (Figma-inspired, dark-mode adapted) ──── */
-interface TrackStyle {
-  /** Clip solid background */
-  clip: string;
-  /** Dark text color for label on clip */
-  label: string;
-  /** Track row tint (very subtle) */
-  row: string;
-  /** Gutter icon circle background */
-  gutter: string;
-  /** SVG icon paths (viewBox 0 0 24 24) */
+interface TrackVisualStyle extends TimelineTrackStyle {
   icon: ReactNode;
 }
 
@@ -46,89 +56,29 @@ const IconText = <TimelineIcon src={`${ICON_BASE}/text.svg`} />;
 const IconComposition = <TimelineIcon src={`${ICON_BASE}/composition.svg`} />;
 const IconAudio = <TimelineIcon src={`${ICON_BASE}/audio.svg`} />;
 
-const STYLES: Record<string, TrackStyle> = {
-  video: {
-    clip: "#1F6AFF",
-    label: "#DBEAFE",
-    row: "rgba(31,106,255,0.04)",
-    gutter: "#1F6AFF",
-    icon: IconImage,
-  },
-  audio: {
-    clip: "#00C4FF",
-    label: "#013A4B",
-    row: "rgba(0,196,255,0.04)",
-    gutter: "#00C4FF",
-    icon: IconMusic,
-  },
-  img: {
-    clip: "#8B5CF6",
-    label: "#EDE9FE",
-    row: "rgba(139,92,246,0.04)",
-    gutter: "#8B5CF6",
-    icon: IconImage,
-  },
-  div: {
-    clip: "#68B200",
-    label: "#1A2B03",
-    row: "rgba(104,178,0,0.04)",
-    gutter: "#68B200",
-    icon: IconComposition,
-  },
-  span: {
-    clip: "#F3A6FF",
-    label: "#8D00A3",
-    row: "rgba(243,166,255,0.04)",
-    gutter: "#F3A6FF",
-    icon: IconCaptions,
-  },
-  p: {
-    clip: "#35C838",
-    label: "#024A03",
-    row: "rgba(53,200,56,0.04)",
-    gutter: "#35C838",
-    icon: IconText,
-  },
-  h1: {
-    clip: "#35C838",
-    label: "#024A03",
-    row: "rgba(53,200,56,0.04)",
-    gutter: "#35C838",
-    icon: IconText,
-  },
-  section: {
-    clip: "#68B200",
-    label: "#1A2B03",
-    row: "rgba(104,178,0,0.04)",
-    gutter: "#68B200",
-    icon: IconComposition,
-  },
-  sfx: {
-    clip: "#FF8C42",
-    label: "#512000",
-    row: "rgba(255,140,66,0.04)",
-    gutter: "#FF8C42",
-    icon: IconAudio,
-  },
+const ICONS: Record<string, ReactNode> = {
+  video: IconImage,
+  audio: IconMusic,
+  img: IconImage,
+  div: IconComposition,
+  span: IconCaptions,
+  p: IconText,
+  h1: IconText,
+  section: IconComposition,
+  sfx: IconAudio,
 };
 
-const DEFAULT: TrackStyle = {
-  clip: "#6B7280",
-  label: "#F3F4F6",
-  row: "rgba(107,114,128,0.03)",
-  gutter: "#6B7280",
-  icon: IconComposition,
-};
-
-function getStyle(tag: string): TrackStyle {
-  const t = tag.toLowerCase();
-  if (t.startsWith("h") && t.length === 2 && "123456".includes(t[1])) return STYLES.h1;
-  return STYLES[t] ?? DEFAULT;
-}
-
-function clampTime(value: number, min: number, max: number): number {
-  if (!Number.isFinite(value)) return min;
-  return Math.max(min, Math.min(max, value));
+function getStyle(tag: string): TrackVisualStyle {
+  const trackStyle = getTimelineTrackStyle(tag);
+  const normalized = tag.toLowerCase();
+  const icon =
+    normalized.startsWith("h") && normalized.length === 2 && "123456".includes(normalized[1] ?? "")
+      ? ICONS.h1
+      : (ICONS[normalized] ?? IconComposition);
+  return {
+    ...trackStyle,
+    icon,
+  };
 }
 
 /* ── Tick Generation ────────────────────────────────────────────── */
@@ -157,6 +107,30 @@ export function generateTicks(duration: number): { major: number[]; minor: numbe
   return { major, minor };
 }
 
+export function shouldAutoScrollTimeline(
+  zoomMode: ZoomMode,
+  scrollWidth: number,
+  clientWidth: number,
+): boolean {
+  if (zoomMode === "fit") return false;
+  if (!Number.isFinite(scrollWidth) || !Number.isFinite(clientWidth)) return false;
+  return scrollWidth - clientWidth > 1;
+}
+
+export function getTimelineScrollLeftForZoomTransition(
+  previousZoomMode: ZoomMode | null,
+  nextZoomMode: ZoomMode,
+  currentScrollLeft: number,
+): number {
+  if (previousZoomMode === "manual" && nextZoomMode === "fit") return 0;
+  return currentScrollLeft;
+}
+
+export function getTimelinePlayheadLeft(time: number, pixelsPerSecond: number): number {
+  if (!Number.isFinite(time) || !Number.isFinite(pixelsPerSecond)) return GUTTER;
+  return GUTTER + Math.max(0, time) * Math.max(0, pixelsPerSecond);
+}
+
 /* ── Component ──────────────────────────────────────────────────── */
 interface TimelineProps {
   /** Called when user seeks via ruler/track click or playhead drag */
@@ -172,10 +146,44 @@ interface TimelineProps {
   renderClipOverlay?: (element: import("../store/playerStore").TimelineElement) => ReactNode;
   /** Called when files are dropped onto the empty timeline */
   onFileDrop?: (files: File[]) => void;
-  /** Called on pointerup after a clip drag or trim. `start`/`duration` are
-      the final values in seconds. Implementations typically persist these
-      to the source HTML as `data-start` / `data-duration` attributes. */
-  onTimingChange?: (elementId: string, start: number, duration: number) => void;
+  /** Persist a clip move back into source HTML */
+  onMoveElement?: (
+    element: import("../store/playerStore").TimelineElement,
+    updates: Pick<import("../store/playerStore").TimelineElement, "start" | "track">,
+  ) => Promise<void> | void;
+  onResizeElement?: (
+    element: import("../store/playerStore").TimelineElement,
+    updates: Pick<
+      import("../store/playerStore").TimelineElement,
+      "start" | "duration" | "playbackStart"
+    >,
+  ) => Promise<void> | void;
+  theme?: Partial<TimelineTheme>;
+}
+
+interface DraggedClipState {
+  element: TimelineElement;
+  originClientX: number;
+  originClientY: number;
+  originScrollLeft: number;
+  originScrollTop: number;
+  pointerClientX: number;
+  pointerClientY: number;
+  pointerOffsetX: number;
+  pointerOffsetY: number;
+  previewStart: number;
+  previewTrack: number;
+  started: boolean;
+}
+
+interface ResizingClipState {
+  element: TimelineElement;
+  edge: "start" | "end";
+  originClientX: number;
+  previewStart: number;
+  previewDuration: number;
+  previewPlaybackStart?: number;
+  started: boolean;
 }
 
 export const Timeline = memo(function Timeline({
@@ -184,33 +192,26 @@ export const Timeline = memo(function Timeline({
   renderClipContent,
   renderClipOverlay,
   onFileDrop,
-  onTimingChange,
+  onMoveElement,
+  onResizeElement,
+  theme: themeOverrides,
 }: TimelineProps = {}) {
+  const theme = useMemo(() => ({ ...defaultTimelineTheme, ...themeOverrides }), [themeOverrides]);
   const elements = usePlayerStore((s) => s.elements);
   const duration = usePlayerStore((s) => s.duration);
   const timelineReady = usePlayerStore((s) => s.timelineReady);
   const selectedElementId = usePlayerStore((s) => s.selectedElementId);
   const setSelectedElementId = usePlayerStore((s) => s.setSelectedElementId);
   const updateElement = usePlayerStore((s) => s.updateElement);
+  const currentTime = usePlayerStore((s) => s.currentTime);
   const zoomMode = usePlayerStore((s) => s.zoomMode);
-  const manualPps = usePlayerStore((s) => s.pixelsPerSecond);
+  const manualZoomPercent = usePlayerStore((s) => s.manualZoomPercent);
   const playheadRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [hoveredClip, setHoveredClip] = useState<string | null>(null);
   const isDragging = useRef(false);
 
-  // Timeline clip drag / trim state. Pointer capture is on the scroll
-  // container (same one used for ruler seeking) so the existing
-  // handlePointerMove / handlePointerUp run for every frame of the drag.
-  const timingDragRef = useRef<{
-    elementId: string;
-    mode: "move" | "trim-left" | "trim-right";
-    startPointerX: number;
-    startStart: number;
-    startDuration: number;
-    moved: boolean;
-  } | null>(null);
   // Range selection (Shift+drag)
   const [shiftHeld, setShiftHeld] = useState(false);
   useMountEffect(() => {
@@ -234,7 +235,19 @@ export const Timeline = memo(function Timeline({
     anchorX: number;
     anchorY: number;
   } | null>(null);
+  const [draggedClip, setDraggedClip] = useState<DraggedClipState | null>(null);
+  const draggedClipRef = useRef<DraggedClipState | null>(null);
+  draggedClipRef.current = draggedClip;
+  const [resizingClip, setResizingClip] = useState<ResizingClipState | null>(null);
+  const resizingClipRef = useRef<ResizingClipState | null>(null);
+  resizingClipRef.current = resizingClip;
+  const onMoveElementRef = useRef(onMoveElement);
+  onMoveElementRef.current = onMoveElement;
+  const onResizeElementRef = useRef(onResizeElement);
+  onResizeElementRef.current = onResizeElement;
+  const suppressClickRef = useRef(false);
   const [showPopover, setShowPopover] = useState(false);
+  const [copiedAgentElementKey, setCopiedAgentElementKey] = useState<string | null>(null);
   const [viewportWidth, setViewportWidth] = useState(0);
   const roRef = useRef<ResizeObserver | null>(null);
 
@@ -272,30 +285,91 @@ export const Timeline = memo(function Timeline({
     return Number.isFinite(result) ? result : safeDur;
   }, [elements, duration]);
 
+  const tracks = useMemo(() => {
+    const map = new Map<number, typeof elements>();
+    for (const el of elements) {
+      const list = map.get(el.track) ?? [];
+      list.push(el);
+      map.set(el.track, list);
+    }
+    return Array.from(map.entries()).sort(([a], [b]) => a - b);
+  }, [elements]);
+
+  const trackStyles = useMemo(() => {
+    const map = new Map<number, TrackVisualStyle>();
+    for (const [trackNum, els] of tracks) {
+      map.set(trackNum, getStyle(els[0]?.tag ?? ""));
+    }
+    return map;
+  }, [tracks]);
+
+  const trackOrder = useMemo(() => tracks.map(([trackNum]) => trackNum), [tracks]);
+  const trackOrderRef = useRef(trackOrder);
+  trackOrderRef.current = trackOrder;
+  const displayTrackOrder = useMemo(() => {
+    if (
+      !draggedClip?.started ||
+      trackOrder.length === 0 ||
+      trackOrder.includes(draggedClip.previewTrack)
+    ) {
+      return trackOrder;
+    }
+    return [...trackOrder, draggedClip.previewTrack].sort((a, b) => a - b);
+  }, [draggedClip, trackOrder]);
+
   // Calculate effective pixels per second
   // In fit mode, use clientWidth (excludes scrollbar) with a small padding
   const fitPps =
     viewportWidth > GUTTER && effectiveDuration > 0
       ? (viewportWidth - GUTTER - 2) / effectiveDuration
       : 100;
-  const pps = zoomMode === "fit" ? fitPps : manualPps;
+  const pps = getTimelinePixelsPerSecond(fitPps, zoomMode, manualZoomPercent);
   const trackContentWidth = Math.max(0, effectiveDuration * pps);
+  const zoomModeRef = useRef(zoomMode);
+  zoomModeRef.current = zoomMode;
+  const previousZoomModeRef = useRef<ZoomMode | null>(zoomMode);
 
   const durationRef = useRef(effectiveDuration);
   durationRef.current = effectiveDuration;
   const ppsRef = useRef(pps);
   ppsRef.current = pps;
+  const syncPlayheadPosition = useCallback((time: number) => {
+    if (!playheadRef.current || durationRef.current <= 0) return;
+    playheadRef.current.style.left = `${getTimelinePlayheadLeft(time, ppsRef.current)}px`;
+  }, []);
+
+  useEffect(() => {
+    syncPlayheadPosition(currentTime);
+  }, [currentTime, pps, syncPlayheadPosition]);
+
+  useEffect(() => {
+    const scroll = scrollRef.current;
+    if (!scroll) {
+      previousZoomModeRef.current = zoomMode;
+      return;
+    }
+    scroll.scrollLeft = getTimelineScrollLeftForZoomTransition(
+      previousZoomModeRef.current,
+      zoomMode,
+      scroll.scrollLeft,
+    );
+    previousZoomModeRef.current = zoomMode;
+  }, [zoomMode]);
+
   useMountEffect(() => {
     const unsub = liveTime.subscribe((t) => {
       const dur = durationRef.current;
       if (!playheadRef.current || dur <= 0) return;
-      const px = t * ppsRef.current;
-      playheadRef.current.style.left = `${GUTTER + px}px`;
+      const playheadX = getTimelinePlayheadLeft(t, ppsRef.current);
+      playheadRef.current.style.left = `${playheadX}px`;
 
       // Auto-scroll to follow playhead during playback or seeking
       const scroll = scrollRef.current;
-      if (scroll && !isDragging.current) {
-        const playheadX = GUTTER + px;
+      if (
+        scroll &&
+        !isDragging.current &&
+        shouldAutoScrollTimeline(zoomModeRef.current, scroll.scrollWidth, scroll.clientWidth)
+      ) {
         const visibleRight = scroll.scrollLeft + scroll.clientWidth;
         const visibleLeft = scroll.scrollLeft;
         const edgeMargin = scroll.clientWidth * 0.12;
@@ -313,6 +387,106 @@ export const Timeline = memo(function Timeline({
   });
 
   const dragScrollRaf = useRef(0);
+  const clipDragScrollRaf = useRef(0);
+  const clipDragPointerRef = useRef<{ clientX: number; clientY: number } | null>(null);
+
+  const updateDraggedClipPreview = useCallback(
+    (drag: DraggedClipState, clientX: number, clientY: number) => {
+      const scroll = scrollRef.current;
+      const nextMove = resolveTimelineMove(
+        {
+          start: drag.element.start,
+          track: drag.element.track,
+          duration: drag.element.duration,
+          originClientX: drag.originClientX,
+          originClientY: drag.originClientY,
+          originScrollLeft: drag.originScrollLeft,
+          originScrollTop: drag.originScrollTop,
+          currentScrollLeft: scroll?.scrollLeft ?? drag.originScrollLeft,
+          currentScrollTop: scroll?.scrollTop ?? drag.originScrollTop,
+          pixelsPerSecond: ppsRef.current,
+          trackHeight: TRACK_H,
+          maxStart: Math.max(0, durationRef.current - drag.element.duration),
+          trackOrder: trackOrderRef.current,
+        },
+        clientX,
+        clientY,
+      );
+
+      return {
+        ...drag,
+        started: true,
+        pointerClientX: clientX,
+        pointerClientY: clientY,
+        previewStart: nextMove.start,
+        previewTrack: nextMove.track,
+      };
+    },
+    [],
+  );
+
+  const stopClipDragAutoScroll = useCallback(() => {
+    clipDragPointerRef.current = null;
+    if (clipDragScrollRaf.current) {
+      cancelAnimationFrame(clipDragScrollRaf.current);
+      clipDragScrollRaf.current = 0;
+    }
+  }, []);
+
+  const stepClipDragAutoScroll = useCallback(() => {
+    clipDragScrollRaf.current = 0;
+    const drag = draggedClipRef.current;
+    const pointer = clipDragPointerRef.current;
+    const scroll = scrollRef.current;
+    if (!drag || !pointer || !scroll) return;
+
+    const rect = scroll.getBoundingClientRect();
+    const delta = resolveTimelineAutoScroll(rect, pointer.clientX, pointer.clientY);
+    if (delta.x === 0 && delta.y === 0) return;
+
+    const maxScrollLeft = Math.max(0, scroll.scrollWidth - scroll.clientWidth);
+    const maxScrollTop = Math.max(0, scroll.scrollHeight - scroll.clientHeight);
+    const nextScrollLeft = Math.max(0, Math.min(maxScrollLeft, scroll.scrollLeft + delta.x));
+    const nextScrollTop = Math.max(0, Math.min(maxScrollTop, scroll.scrollTop + delta.y));
+    const didScroll = nextScrollLeft !== scroll.scrollLeft || nextScrollTop !== scroll.scrollTop;
+
+    if (!didScroll) return;
+
+    scroll.scrollLeft = nextScrollLeft;
+    scroll.scrollTop = nextScrollTop;
+    setDraggedClip((prev) =>
+      prev ? updateDraggedClipPreview(prev, pointer.clientX, pointer.clientY) : prev,
+    );
+
+    clipDragScrollRaf.current = requestAnimationFrame(stepClipDragAutoScroll);
+  }, [updateDraggedClipPreview]);
+
+  const syncClipDragAutoScroll = useCallback(
+    (clientX: number, clientY: number) => {
+      clipDragPointerRef.current = { clientX, clientY };
+      const scroll = scrollRef.current;
+      if (!scroll) return;
+      const rect = scroll.getBoundingClientRect();
+      const delta = resolveTimelineAutoScroll(rect, clientX, clientY);
+      if (delta.x === 0 && delta.y === 0) {
+        if (clipDragScrollRaf.current) {
+          cancelAnimationFrame(clipDragScrollRaf.current);
+          clipDragScrollRaf.current = 0;
+        }
+        return;
+      }
+      if (!clipDragScrollRaf.current) {
+        clipDragScrollRaf.current = requestAnimationFrame(stepClipDragAutoScroll);
+      }
+    },
+    [stepClipDragAutoScroll],
+  );
+  const updateDraggedClipPreviewRef = useRef(updateDraggedClipPreview);
+  updateDraggedClipPreviewRef.current = updateDraggedClipPreview;
+  const syncClipDragAutoScrollRef = useRef(syncClipDragAutoScroll);
+  syncClipDragAutoScrollRef.current = syncClipDragAutoScroll;
+  const stopClipDragAutoScrollRef = useRef(stopClipDragAutoScroll);
+  stopClipDragAutoScrollRef.current = stopClipDragAutoScroll;
 
   const seekFromX = useCallback(
     (clientX: number) => {
@@ -334,7 +508,13 @@ export const Timeline = memo(function Timeline({
     (clientX: number) => {
       cancelAnimationFrame(dragScrollRaf.current);
       const el = scrollRef.current;
-      if (!el || !isDragging.current) return;
+      if (
+        !el ||
+        !isDragging.current ||
+        !shouldAutoScrollTimeline(zoomModeRef.current, el.scrollWidth, el.clientWidth)
+      ) {
+        return;
+      }
       const rect = el.getBoundingClientRect();
       const edgeZone = 40;
       const maxSpeed = 12;
@@ -359,6 +539,158 @@ export const Timeline = memo(function Timeline({
     [seekFromX],
   );
 
+  useMountEffect(() => {
+    const clearSuppressedClick = () => {
+      requestAnimationFrame(() => {
+        suppressClickRef.current = false;
+      });
+    };
+
+    const handleWindowPointerMove = (e: PointerEvent) => {
+      const drag = draggedClipRef.current;
+      const resize = resizingClipRef.current;
+      if (resize) {
+        const distance = Math.abs(e.clientX - resize.originClientX);
+        if (!resize.started && distance < 2) return;
+
+        setShowPopover(false);
+        setRangeSelection(null);
+
+        const sourceRemaining =
+          resize.element.sourceDuration != null
+            ? Math.max(
+                0,
+                (resize.element.sourceDuration - (resize.element.playbackStart ?? 0)) /
+                  Math.max(resize.element.playbackRate ?? 1, 0.1),
+              )
+            : Number.POSITIVE_INFINITY;
+        const nextResize = resolveTimelineResize(
+          {
+            start: resize.element.start,
+            duration: resize.element.duration,
+            originClientX: resize.originClientX,
+            pixelsPerSecond: ppsRef.current,
+            minStart: 0,
+            maxEnd: Math.min(durationRef.current, resize.element.start + sourceRemaining),
+            playbackStart: resize.element.playbackStart,
+            playbackRate: resize.element.playbackRate,
+          },
+          resize.edge,
+          e.clientX,
+        );
+
+        setResizingClip((prev) =>
+          prev
+            ? {
+                ...prev,
+                started: true,
+                previewStart: nextResize.start,
+                previewDuration: nextResize.duration,
+                previewPlaybackStart: nextResize.playbackStart,
+              }
+            : prev,
+        );
+        return;
+      }
+      if (!drag) return;
+
+      const distance = Math.hypot(e.clientX - drag.originClientX, e.clientY - drag.originClientY);
+      if (!drag.started && distance < 4) return;
+
+      setShowPopover(false);
+      setRangeSelection(null);
+
+      setDraggedClip((prev) =>
+        prev ? updateDraggedClipPreviewRef.current(prev, e.clientX, e.clientY) : prev,
+      );
+      syncClipDragAutoScrollRef.current(e.clientX, e.clientY);
+    };
+
+    const handleWindowPointerUp = () => {
+      stopClipDragAutoScrollRef.current();
+      const resize = resizingClipRef.current;
+      if (resize) {
+        resizingClipRef.current = null;
+        setResizingClip(null);
+
+        if (!resize.started) return;
+
+        suppressClickRef.current = true;
+        clearSuppressedClick();
+
+        const hasChanged =
+          resize.previewStart !== resize.element.start ||
+          resize.previewDuration !== resize.element.duration ||
+          resize.previewPlaybackStart !== resize.element.playbackStart;
+        if (!hasChanged) return;
+
+        updateElement(resize.element.key ?? resize.element.id, {
+          start: resize.previewStart,
+          duration: resize.previewDuration,
+          playbackStart: resize.previewPlaybackStart,
+        });
+
+        Promise.resolve(
+          onResizeElementRef.current?.(resize.element, {
+            start: resize.previewStart,
+            duration: resize.previewDuration,
+            playbackStart: resize.previewPlaybackStart,
+          }),
+        ).catch((error) => {
+          updateElement(resize.element.key ?? resize.element.id, {
+            start: resize.element.start,
+            duration: resize.element.duration,
+            playbackStart: resize.element.playbackStart,
+          });
+          console.error("[Timeline] Failed to persist clip resize", error);
+        });
+        return;
+      }
+
+      const drag = draggedClipRef.current;
+      if (!drag) return;
+      draggedClipRef.current = null;
+      setDraggedClip(null);
+
+      if (!drag.started) return;
+
+      suppressClickRef.current = true;
+      clearSuppressedClick();
+
+      const hasChanged =
+        drag.previewStart !== drag.element.start || drag.previewTrack !== drag.element.track;
+      if (!hasChanged) return;
+
+      updateElement(drag.element.key ?? drag.element.id, {
+        start: drag.previewStart,
+        track: drag.previewTrack,
+      });
+
+      Promise.resolve(
+        onMoveElementRef.current?.(drag.element, {
+          start: drag.previewStart,
+          track: drag.previewTrack,
+        }),
+      ).catch((error) => {
+        updateElement(drag.element.key ?? drag.element.id, {
+          start: drag.element.start,
+          track: drag.element.track,
+        });
+        console.error("[Timeline] Failed to persist clip move", error);
+      });
+    };
+
+    window.addEventListener("pointermove", handleWindowPointerMove);
+    window.addEventListener("pointerup", handleWindowPointerUp);
+    window.addEventListener("pointercancel", handleWindowPointerUp);
+    return () => {
+      stopClipDragAutoScrollRef.current();
+      window.removeEventListener("pointermove", handleWindowPointerMove);
+      window.removeEventListener("pointerup", handleWindowPointerUp);
+      window.removeEventListener("pointercancel", handleWindowPointerUp);
+    };
+  });
+
   const handlePointerDown = useCallback(
     (e: React.PointerEvent) => {
       if (e.button !== 0) return;
@@ -378,40 +710,6 @@ export const Timeline = memo(function Timeline({
         return;
       }
 
-      // Clip body or trim-edge drag — detect via data-clip-role markers.
-      // Only engage when onTimingChange is wired (i.e. parent knows how to
-      // persist the change). Otherwise we fall through to the old click-
-      // to-select behaviour.
-      if (onTimingChange) {
-        const target = e.target as HTMLElement | null;
-        const roleEl = target?.closest("[data-clip-role]") as HTMLElement | null;
-        const clipEl = target?.closest("[data-clip]") as HTMLElement | null;
-        if (roleEl && clipEl) {
-          const role = roleEl.getAttribute("data-clip-role");
-          const elementId = clipEl.getAttribute("data-element-id");
-          const element = elementId
-            ? usePlayerStore.getState().elements.find((el) => el.id === elementId)
-            : null;
-          if (element && (role === "move" || role === "trim-left" || role === "trim-right")) {
-            (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-            timingDragRef.current = {
-              elementId: element.id,
-              mode: role,
-              startPointerX: e.clientX,
-              startStart: element.start,
-              startDuration: element.duration,
-              moved: false,
-            };
-            setShowPopover(false);
-            // Don't stopPropagation — we want the existing click to still
-            // fire for simple selections. But do prevent the default text-
-            // selection drag.
-            e.preventDefault();
-            return;
-          }
-        }
-      }
-
       // Normal click on a clip — let the clip handle it
       if ((e.target as HTMLElement).closest("[data-clip]")) return;
       (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
@@ -421,37 +719,10 @@ export const Timeline = memo(function Timeline({
       setShowPopover(false);
       seekFromX(e.clientX);
     },
-    [seekFromX, pps, onTimingChange],
+    [seekFromX, pps],
   );
   const handlePointerMove = useCallback(
     (e: React.PointerEvent) => {
-      // Clip drag / trim takes priority — it lives on top of any other
-      // pointer interpretation. Pointer delta is converted to seconds
-      // using the current pps and snapped to 1/20s (50 ms) so fine-tuning
-      // is still possible but saves are clean.
-      if (timingDragRef.current) {
-        const d = timingDragRef.current;
-        const rawDx = (e.clientX - d.startPointerX) / pps;
-        // 50 ms snap — fine enough for precision, coarse enough to avoid
-        // saving 0.34756 every time.
-        const dx = Math.round(rawDx * 20) / 20;
-        if (Math.abs(dx) >= 0.01) d.moved = true;
-
-        if (d.mode === "move") {
-          const newStart = clampTime(d.startStart + dx, 0, 7200);
-          updateElement(d.elementId, { start: newStart });
-        } else if (d.mode === "trim-left") {
-          const newStart = clampTime(d.startStart + dx, 0, d.startStart + d.startDuration - 0.1);
-          const deltaStart = newStart - d.startStart;
-          const newDuration = Math.max(0.1, d.startDuration - deltaStart);
-          updateElement(d.elementId, { start: newStart, duration: newDuration });
-        } else if (d.mode === "trim-right") {
-          const newDuration = Math.max(0.1, d.startDuration + dx);
-          updateElement(d.elementId, { duration: newDuration });
-        }
-        return;
-      }
-
       if (isRangeSelecting.current) {
         const rect = scrollRef.current?.getBoundingClientRect();
         if (rect) {
@@ -467,20 +738,9 @@ export const Timeline = memo(function Timeline({
       seekFromX(e.clientX);
       autoScrollDuringDrag(e.clientX);
     },
-    [seekFromX, autoScrollDuringDrag, pps, updateElement],
+    [seekFromX, autoScrollDuringDrag, pps],
   );
   const handlePointerUp = useCallback(() => {
-    // Commit clip-timing drag if one was in flight.
-    if (timingDragRef.current) {
-      const d = timingDragRef.current;
-      timingDragRef.current = null;
-      if (d.moved) {
-        const el = usePlayerStore.getState().elements.find((x) => x.id === d.elementId);
-        if (el && onTimingChange) onTimingChange(el.id, el.start, el.duration);
-      }
-      return;
-    }
-
     if (isRangeSelecting.current) {
       isRangeSelecting.current = false;
       // Show popover if range is meaningful (> 0.2s)
@@ -495,28 +755,23 @@ export const Timeline = memo(function Timeline({
     }
     isDragging.current = false;
     cancelAnimationFrame(dragScrollRaf.current);
-  }, [onTimingChange]);
-
-  const tracks = useMemo(() => {
-    const map = new Map<number, typeof elements>();
-    for (const el of elements) {
-      const list = map.get(el.track) ?? [];
-      list.push(el);
-      map.set(el.track, list);
-    }
-    return Array.from(map.entries()).sort(([a], [b]) => a - b);
-  }, [elements]);
-
-  // Determine dominant style per track (from first element)
-  const trackStyles = useMemo(() => {
-    const map = new Map<number, TrackStyle>();
-    for (const [trackNum, els] of tracks) {
-      map.set(trackNum, getStyle(els[0]?.tag ?? ""));
-    }
-    return map;
-  }, [tracks]);
+  }, []);
 
   const { major, minor } = useMemo(() => generateTicks(effectiveDuration), [effectiveDuration]);
+  const getPreviewElement = useCallback(
+    (element: TimelineElement): TimelineElement => {
+      if (resizingClip?.element.id === element.id) {
+        return {
+          ...element,
+          start: resizingClip.previewStart,
+          duration: resizingClip.previewDuration,
+          playbackStart: resizingClip.previewPlaybackStart,
+        };
+      }
+      return element;
+    },
+    [resizingClip],
+  );
 
   const [isDragOver, setIsDragOver] = useState(false);
 
@@ -617,14 +872,133 @@ export const Timeline = memo(function Timeline({
     );
   }
 
-  const totalH = RULER_H + tracks.length * TRACK_H;
+  const totalH = RULER_H + displayTrackOrder.length * TRACK_H;
+  const draggedElement = draggedClip?.element ?? null;
+  const activeDraggedElement =
+    draggedClip?.started === true && draggedElement
+      ? getRenderedTimelineElement({
+          element: draggedElement,
+          draggedElementId: draggedElement.id,
+          previewStart: draggedClip.previewStart,
+          previewTrack: draggedClip.previewTrack,
+        })
+      : null;
+  const activeDraggedPosition =
+    draggedClip?.started === true && activeDraggedElement && scrollRef.current
+      ? {
+          left:
+            draggedClip.pointerClientX -
+            scrollRef.current.getBoundingClientRect().left +
+            scrollRef.current.scrollLeft -
+            draggedClip.pointerOffsetX,
+          top:
+            draggedClip.pointerClientY -
+            scrollRef.current.getBoundingClientRect().top +
+            scrollRef.current.scrollTop -
+            draggedClip.pointerOffsetY,
+        }
+      : null;
+  const renderClipChildren = (element: TimelineElement, clipStyle: TrackVisualStyle) => {
+    const capabilities = getTimelineEditCapabilities(element);
+    const elementKey = element.key ?? element.id;
+    const needsAgentFallback =
+      !capabilities.canMove && !capabilities.canTrimStart && !capabilities.canTrimEnd;
+    const agentButton = needsAgentFallback ? (
+      <button
+        type="button"
+        onPointerDown={(e) => e.stopPropagation()}
+        onClick={async (e) => {
+          e.stopPropagation();
+          const text = buildTimelineElementAgentPrompt(element);
+          try {
+            await navigator.clipboard.writeText(text);
+          } catch {
+            const ta = document.createElement("textarea");
+            ta.value = text;
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand("copy");
+            document.body.removeChild(ta);
+          }
+          setCopiedAgentElementKey(elementKey);
+          window.setTimeout(() => {
+            setCopiedAgentElementKey((current) => (current === elementKey ? null : current));
+          }, 900);
+        }}
+        className="absolute bottom-2 right-2 z-[5] rounded-md px-1.5 py-0.5 text-[10px] font-medium leading-none transition-colors"
+        style={{
+          color: copiedAgentElementKey === elementKey ? "#86efac" : clipStyle.label,
+          background:
+            copiedAgentElementKey === elementKey ? "rgba(34,197,94,0.16)" : `${clipStyle.accent}1e`,
+          boxShadow:
+            copiedAgentElementKey === elementKey
+              ? "inset 0 0 0 1px rgba(34,197,94,0.28)"
+              : `inset 0 0 0 1px ${clipStyle.accent}33`,
+        }}
+      >
+        {copiedAgentElementKey === elementKey ? "Copied!" : "Copy to Agent"}
+      </button>
+    ) : null;
+    return (
+      <>
+        {renderClipOverlay?.(element)}
+        <div
+          className={
+            renderClipContent
+              ? "absolute inset-0 overflow-hidden"
+              : "flex flex-col justify-center overflow-hidden flex-1 min-w-0 px-6"
+          }
+        >
+          {renderClipContent?.(element, clipStyle) ?? (
+            <div className="flex h-full min-h-0 flex-col justify-between py-3">
+              <div className="flex items-start">
+                <span
+                  className="max-w-full truncate rounded-md px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.08em] leading-none"
+                  style={{
+                    color: clipStyle.label,
+                    background: `${clipStyle.accent}26`,
+                    boxShadow: `inset 0 0 0 1px ${clipStyle.accent}33`,
+                  }}
+                >
+                  {element.tag}
+                </span>
+              </div>
+              <span
+                className="text-[14px] font-semibold truncate leading-none tracking-[-0.02em]"
+                style={{ color: theme.textPrimary }}
+              >
+                {element.id || element.tag}
+              </span>
+              <div className="flex items-center">
+                <span
+                  className="max-w-full truncate rounded-md px-1.5 py-0.5 text-[10px] font-medium tabular-nums leading-none"
+                  style={{
+                    color: theme.textSecondary,
+                    background: "rgba(255,255,255,0.04)",
+                  }}
+                >
+                  {formatTime(element.start)} {"\u2192"}{" "}
+                  {formatTime(element.start + element.duration)}
+                </span>
+              </div>
+            </div>
+          )}
+        </div>
+        {agentButton}
+      </>
+    );
+  };
 
   return (
     <div
       ref={setContainerRef}
       aria-label="Timeline"
-      className={`border-t border-neutral-800/50 bg-[#0a0a0b] select-none h-full overflow-hidden ${shiftHeld ? "cursor-crosshair" : "cursor-default"}`}
-      style={{ touchAction: "pan-x pan-y" }}
+      className={`border-t select-none h-full overflow-hidden ${shiftHeld ? "cursor-crosshair" : "cursor-default"}`}
+      style={{
+        touchAction: "pan-x pan-y",
+        background: theme.shellBackground,
+        borderColor: theme.shellBorder,
+      }}
     >
       <div
         ref={scrollRef}
@@ -650,7 +1024,7 @@ export const Timeline = memo(function Timeline({
                   y1={RULER_H}
                   x2={x}
                   y2={totalH}
-                  stroke="rgba(255,255,255,0.035)"
+                  stroke={theme.tickMinor}
                   strokeWidth="1"
                 />
               );
@@ -659,20 +1033,20 @@ export const Timeline = memo(function Timeline({
 
           {/* Ruler */}
           <div
-            className="relative border-b border-neutral-800/40 overflow-hidden"
+            className="relative overflow-hidden"
             style={{ height: RULER_H, marginLeft: GUTTER, width: trackContentWidth }}
           >
             {/* Shift hint */}
             {shiftHeld && !rangeSelection && (
               <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-10">
-                <span className="text-[9px] text-studio-accent/60 font-medium">
+                <span className="text-[9px] font-medium" style={{ color: theme.textSecondary }}>
                   Drag to select range
                 </span>
               </div>
             )}
             {minor.map((t) => (
               <div key={`m-${t}`} className="absolute bottom-0" style={{ left: t * pps }}>
-                <div className="w-px h-[3px] bg-neutral-700/40" />
+                <div className="w-px h-[3px]" style={{ background: theme.tickMinor }} />
               </div>
             ))}
             {major.map((t) => (
@@ -681,36 +1055,49 @@ export const Timeline = memo(function Timeline({
                 className="absolute bottom-0 flex flex-col items-center"
                 style={{ left: t * pps }}
               >
-                <span className="text-[9px] text-neutral-500 font-mono tabular-nums leading-none mb-0.5">
+                <span
+                  className="text-[9px] font-mono tabular-nums leading-none mb-0.5"
+                  style={{ color: theme.tickText }}
+                >
                   {formatTime(t)}
                 </span>
-                <div className="w-px h-[5px] bg-neutral-600/60" />
+                <div className="w-px h-[5px]" style={{ background: theme.tickMajor }} />
               </div>
             ))}
           </div>
 
           {/* Tracks */}
-          {tracks.map(([trackNum, els]) => {
-            const ts = trackStyles.get(trackNum) ?? DEFAULT;
+          {displayTrackOrder.map((trackNum) => {
+            const els = tracks.find(([currentTrack]) => currentTrack === trackNum)?.[1] ?? [];
+            const ts = trackStyles.get(trackNum) ?? getStyle("");
+            const isPendingTrack =
+              draggedClip?.started === true && !trackOrder.includes(trackNum) && els.length === 0;
             return (
               <div
                 key={trackNum}
                 className="relative flex"
-                style={{ height: TRACK_H, backgroundColor: ts.row }}
+                style={{
+                  height: TRACK_H,
+                  background: theme.rowBackground,
+                  borderBottom: `1px solid ${theme.rowBorder}`,
+                }}
               >
-                {/* Gutter: colored icon badge (Figma Motion Cut style) */}
                 <div
                   className="flex-shrink-0 flex items-center justify-center"
-                  style={{ width: GUTTER }}
+                  style={{
+                    width: GUTTER,
+                    background: theme.gutterBackground,
+                    borderRight: `1px solid ${theme.gutterBorder}`,
+                  }}
                 >
                   <div
                     className="flex items-center justify-center"
                     style={{
-                      width: 20,
-                      height: 20,
+                      width: 18,
+                      height: 18,
                       borderRadius: 6,
-                      backgroundColor: ts.gutter,
-                      border: "1px solid rgba(255,255,255,0.35)",
+                      backgroundColor: ts.iconBackground,
+                      border: `1px solid ${theme.gutterBorder}`,
                       color: "#fff",
                     }}
                   >
@@ -720,69 +1107,107 @@ export const Timeline = memo(function Timeline({
 
                 {/* Clips */}
                 <div style={{ width: trackContentWidth }} className="relative">
+                  {isPendingTrack && (
+                    <div
+                      className="absolute inset-0 flex items-center"
+                      style={{
+                        paddingLeft: 16,
+                        color: ts.label,
+                        fontSize: 11,
+                        letterSpacing: "0.08em",
+                        textTransform: "uppercase",
+                        background: `linear-gradient(90deg, ${ts.accent}14, transparent 28%)`,
+                        boxShadow: `inset 0 0 0 1px ${ts.accent}24`,
+                      }}
+                    >
+                      New track
+                    </div>
+                  )}
                   {els.map((el, i) => {
                     const clipStyle = getStyle(el.tag);
-                    const isSelected = selectedElementId === el.id;
+                    const elementKey = el.key ?? el.id;
+                    const capabilities = getTimelineEditCapabilities(el);
+                    const isSelected = selectedElementId === elementKey;
                     const isComposition = !!el.compositionSrc;
-                    const clipKey = `${el.id}-${i}`;
+                    const clipKey = `${elementKey}-${i}`;
                     const isHovered = hoveredClip === clipKey;
                     const hasCustomContent = !!renderClipContent;
-                    const clipWidthPx = Math.max(el.duration * pps, 4);
+                    const isDragging =
+                      draggedClip?.started === true &&
+                      (draggedElement?.key ?? draggedElement?.id) === elementKey;
+                    if (isDragging) return null;
+                    const previewElement = getPreviewElement(el);
 
                     return (
                       <TimelineClip
                         key={clipKey}
-                        el={el}
+                        el={previewElement}
                         pps={pps}
                         clipY={CLIP_Y}
                         isSelected={isSelected}
                         isHovered={isHovered}
+                        isDragging={false}
                         hasCustomContent={hasCustomContent}
-                        style={clipStyle}
+                        theme={theme}
+                        trackStyle={clipStyle}
                         isComposition={isComposition}
-                        timingEditable={Boolean(onTimingChange)}
                         onHoverStart={() => setHoveredClip(clipKey)}
                         onHoverEnd={() => setHoveredClip(null)}
-                        onClick={(e) => {
-                          // If the user just finished a drag, suppress the
-                          // click-to-select so an intentional nudge doesn't
-                          // also toggle selection state.
-                          if (timingDragRef.current) return;
+                        onResizeStart={(edge, e) => {
+                          if (e.button !== 0 || e.shiftKey || !onResizeElement) return;
+                          if (edge === "start" && !capabilities.canTrimStart) return;
+                          if (edge === "end" && !capabilities.canTrimEnd) return;
                           e.stopPropagation();
-                          setSelectedElementId(isSelected ? null : el.id);
+                          setShowPopover(false);
+                          setRangeSelection(null);
+                          setResizingClip({
+                            element: el,
+                            edge,
+                            originClientX: e.clientX,
+                            previewStart: el.start,
+                            previewDuration: el.duration,
+                            previewPlaybackStart: el.playbackStart,
+                            started: false,
+                          });
+                        }}
+                        onPointerDown={(e) => {
+                          if (
+                            e.button !== 0 ||
+                            e.shiftKey ||
+                            !onMoveElement ||
+                            !capabilities.canMove
+                          )
+                            return;
+                          setShowPopover(false);
+                          setRangeSelection(null);
+                          const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                          setDraggedClip({
+                            element: el,
+                            originClientX: e.clientX,
+                            originClientY: e.clientY,
+                            originScrollLeft: scrollRef.current?.scrollLeft ?? 0,
+                            originScrollTop: scrollRef.current?.scrollTop ?? 0,
+                            pointerClientX: e.clientX,
+                            pointerClientY: e.clientY,
+                            pointerOffsetX: e.clientX - rect.left,
+                            pointerOffsetY: e.clientY - rect.top,
+                            previewStart: el.start,
+                            previewTrack: el.track,
+                            started: false,
+                          });
+                        }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (suppressClickRef.current) return;
+                          setSelectedElementId(isSelected ? null : elementKey);
                         }}
                         onDoubleClick={(e) => {
                           e.stopPropagation();
+                          if (suppressClickRef.current) return;
                           if (isComposition && onDrillDown) onDrillDown(el);
                         }}
                       >
-                        {renderClipOverlay?.(el)}
-                        <div
-                          className={
-                            renderClipContent
-                              ? "absolute inset-0 overflow-hidden rounded-[4px]"
-                              : "flex items-center overflow-hidden flex-1 min-w-0"
-                          }
-                        >
-                          {renderClipContent?.(el, clipStyle) ?? (
-                            <>
-                              <span
-                                className="text-[10px] font-semibold truncate px-1.5 leading-none"
-                                style={{ color: clipStyle.label }}
-                              >
-                                {el.id || el.tag}
-                              </span>
-                              {clipWidthPx > 60 && (
-                                <span
-                                  className="text-[9px] font-mono tabular-nums pr-1.5 ml-auto flex-shrink-0 leading-none opacity-70"
-                                  style={{ color: clipStyle.label }}
-                                >
-                                  {el.duration.toFixed(1)}s
-                                </span>
-                              )}
-                            </>
-                          )}
-                        </div>
+                        {renderClipChildren(previewElement, clipStyle)}
                       </TimelineClip>
                     );
                   })}
@@ -790,6 +1215,41 @@ export const Timeline = memo(function Timeline({
               </div>
             );
           })}
+
+          {activeDraggedElement && activeDraggedPosition && (
+            <div
+              className="absolute pointer-events-none"
+              style={{
+                top: activeDraggedPosition.top,
+                left: activeDraggedPosition.left,
+                width: Math.max(activeDraggedElement.duration * pps, 4),
+                height: TRACK_H - CLIP_Y * 2,
+                zIndex: 40,
+              }}
+            >
+              <TimelineClip
+                el={{ ...activeDraggedElement, start: 0 }}
+                pps={pps}
+                clipY={0}
+                isSelected={
+                  selectedElementId === (activeDraggedElement.key ?? activeDraggedElement.id)
+                }
+                isHovered={false}
+                isDragging={true}
+                hasCustomContent={!!renderClipContent}
+                theme={theme}
+                trackStyle={getStyle(activeDraggedElement.tag)}
+                isComposition={!!activeDraggedElement.compositionSrc}
+                onHoverStart={() => {}}
+                onHoverEnd={() => {}}
+                onResizeStart={() => {}}
+                onClick={() => {}}
+                onDoubleClick={() => {}}
+              >
+                {renderClipChildren(activeDraggedElement, getStyle(activeDraggedElement.tag))}
+              </TimelineClip>
+            </div>
+          )}
 
           {/* Range selection highlight */}
           {rangeSelection && (
@@ -846,11 +1306,22 @@ export const Timeline = memo(function Timeline({
       {/* Keyboard shortcut hint — always visible */}
       {!showPopover && !rangeSelection && (
         <div className="absolute bottom-2 right-3 pointer-events-none z-20">
-          <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-neutral-800/50 border border-neutral-700/20">
-            <kbd className="text-[9px] font-mono text-neutral-500 bg-neutral-700/40 px-1 py-0.5 rounded">
+          <div
+            className="flex items-center gap-1.5 px-2 py-1 rounded-md border"
+            style={{
+              background: "rgba(17,23,35,0.84)",
+              borderColor: theme.gutterBorder,
+            }}
+          >
+            <kbd
+              className="text-[9px] font-mono px-1 py-0.5 rounded"
+              style={{ color: theme.textSecondary, background: "rgba(255,255,255,0.06)" }}
+            >
               Shift
             </kbd>
-            <span className="text-[9px] text-neutral-600">+ drag to edit range</span>
+            <span className="text-[9px]" style={{ color: theme.textSecondary }}>
+              + drag to edit range
+            </span>
           </div>
         </div>
       )}

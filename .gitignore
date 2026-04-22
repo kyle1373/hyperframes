@@ -14,6 +14,12 @@ dist/
 .DS_Store
 Thumbs.db
 
+# Docs media — served from CDN, not committed.
+# Regenerate with scripts/generate-{catalog,template}-previews.ts then upload
+# with `bun run upload:docs-images`. Add explicit negations below for any
+# non-generated assets (logos, svgs) that should stay in the repo.
+docs/images/
+
 # IDE
 .vscode/
 .idea/
@@ -29,7 +35,13 @@ packages/producer/tests/*/failures/
 
 # Rendered output (not test fixtures — those use git LFS)
 output/
+renders/
 !packages/producer/tests/*/output/
+
+# Composition source media (large binaries)
+compositions/**/*.mp4
+compositions/**/*.mov
+compositions/**/*.MOV
 
 # npm pack artifacts
 *.tgz
@@ -72,3 +84,9 @@ captures/
 *-ad/
 *-tour/
 *-brand/
+
+# Local regression-test and video project scratch directories.
+# These hold per-site captures, compositions, narration audio, rendered MP4s.
+cursor-tests/
+basecamp-video/
+launch-video*/

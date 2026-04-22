@@ -37,6 +37,7 @@ describe("css adapter", () => {
 
     const adapter = createCssAdapter();
     adapter.discover();
+    (el as HTMLElement & { getAnimations?: () => Animation[] }).getAnimations = () => [];
     adapter.seek({ time: 3 });
 
     expect(el.style.animationPlayState).toBe("paused");
@@ -58,6 +59,7 @@ describe("css adapter", () => {
 
     const adapter = createCssAdapter({ resolveStartSeconds: () => 2 });
     adapter.discover();
+    (el as HTMLElement & { getAnimations?: () => Animation[] }).getAnimations = () => [];
     adapter.seek({ time: 5 });
 
     expect(el.style.animationPlayState).toBe("paused");
@@ -80,6 +82,7 @@ describe("css adapter", () => {
 
     const adapter = createCssAdapter();
     adapter.discover();
+    (el as HTMLElement & { getAnimations?: () => Animation[] }).getAnimations = () => [];
     adapter.seek({ time: 1 });
     expect(el.style.animationPlayState).toBe("paused");
 
@@ -95,5 +98,55 @@ describe("css adapter", () => {
     adapter.revert!();
     // Should not crash when seeking after revert
     expect(() => adapter.seek({ time: 1 })).not.toThrow();
+  });
+
+  it("seek drives CSS animations through WAAPI currentTime when available", () => {
+    const el = document.createElement("div");
+    el.setAttribute("data-start", "1");
+    el.style.animationName = "spin";
+    document.body.appendChild(el);
+
+    vi.spyOn(window, "getComputedStyle").mockImplementation(() => {
+      return { animationName: "spin" } as CSSStyleDeclaration;
+    });
+
+    const animation = { currentTime: 0, pause: vi.fn(), play: vi.fn() } as unknown as Animation;
+    (el as HTMLElement & { getAnimations?: () => Animation[] }).getAnimations = () => [animation];
+
+    const adapter = createCssAdapter();
+    adapter.discover();
+    adapter.seek({ time: 3 });
+
+    expect(animation.currentTime).toBe(2000);
+    expect(animation.pause).toHaveBeenCalled();
+    expect(el.style.animationDelay).toBe("");
+    expect(el.style.animationPlayState).toBe("");
+
+    document.body.removeChild(el);
+    vi.restoreAllMocks();
+  });
+
+  it("play resumes WAAPI animations and restores inline styles", () => {
+    const el = document.createElement("div");
+    el.style.animationName = "spin";
+    el.style.animationPlayState = "running";
+    document.body.appendChild(el);
+
+    vi.spyOn(window, "getComputedStyle").mockImplementation(() => {
+      return { animationName: "spin" } as CSSStyleDeclaration;
+    });
+
+    const animation = { currentTime: 0, pause: vi.fn(), play: vi.fn() } as unknown as Animation;
+    (el as HTMLElement & { getAnimations?: () => Animation[] }).getAnimations = () => [animation];
+
+    const adapter = createCssAdapter();
+    adapter.discover();
+    adapter.play?.();
+
+    expect(animation.play).toHaveBeenCalled();
+    expect(el.style.animationPlayState).toBe("running");
+
+    document.body.removeChild(el);
+    vi.restoreAllMocks();
   });
 });

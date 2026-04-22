@@ -1,9 +1,8 @@
 /**
  * Download assets (SVGs, images, favicon, video posters) from extracted tokens + asset catalog.
  *
- * Single-pass approach: uses the asset catalog (which already deduplicates srcset variants
- * and keeps the highest resolution) as the primary source for images. This avoids downloading
- * the same image twice at different resolutions.
+ * Uses the asset catalog (which already deduplicates srcset variants and keeps the highest
+ * resolution) as the single source of truth for images. Favicon links are passed separately.
  */
 
 import { writeFileSync, mkdirSync } from "node:fs";
@@ -15,6 +14,7 @@ export async function downloadAssets(
   tokens: DesignTokens,
   outputDir: string,
   catalogedAssets?: CatalogedAsset[],
+  faviconLinks?: Array<{ rel: string; href: string }>,
 ): Promise<DownloadedAsset[]> {
   const assetsDir = join(outputDir, "assets");
   mkdirSync(assetsDir, { recursive: true });
@@ -39,7 +39,7 @@ export async function downloadAssets(
   }
 
   // 2. Favicon
-  for (const icon of tokens.icons) {
+  for (const icon of faviconLinks || []) {
     if (!icon.href) continue;
     try {
       const ext = extname(new URL(icon.href).pathname) || ".ico";
@@ -57,7 +57,8 @@ export async function downloadAssets(
   }
 
   // 3. Images — use the catalog as the single source of truth (highest resolution, deduplicated)
-  //    If no catalog available, fall back to tokens.images
+  // If the catalog is empty, asset download produces zero images — this is surfaced as a warning
+  // so the capture doesn't silently produce a half-empty dataset.
   const imageUrls: { url: string; isPoster: boolean }[] = [];
 
   if (catalogedAssets && catalogedAssets.length > 0) {
@@ -82,13 +83,6 @@ export async function downloadAssets(
       if (!hasGoodContext) continue;
       const isPoster = a.contexts.includes("video[poster]");
       imageUrls.push({ url: a.url, isPoster });
-    }
-  } else {
-    // Fallback: use tokens.images
-    for (const img of tokens.images) {
-      if (img.width > 200 && img.src.startsWith("http")) {
-        imageUrls.push({ url: img.src, isPoster: false });
-      }
     }
   }
 

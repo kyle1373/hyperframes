@@ -17,6 +17,8 @@ Requires: Docker installed and running.
 - `-f, --fps` — 24, 30, or 60 (default: 30)
 - `-q, --quality` — draft, standard, high (default: standard)
 - `-w, --workers` — Parallel workers 1-8 (default: auto)
+- `--crf` — Override encoder CRF (mutually exclusive with `--video-bitrate`)
+- `--video-bitrate` — Target video bitrate such as `10M` (mutually exclusive with `--crf`)
 - `--gpu` — Use GPU encoding (NVENC, VideoToolbox, VAAPI)
 - `-o, --output` — Custom output path
 

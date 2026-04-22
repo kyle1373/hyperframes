@@ -16,7 +16,7 @@
 <p align="center"><b>Write HTML. Render video. Built for agents.</b></p>
 
 <p align="center">
-  <img src="docs/images/readme-demo.gif" alt="HyperFrames demo — HTML code on the left transforms into a rendered video on the right" width="800">
+  <img src="https://static.heygen.ai/hyperframes-oss/docs/images/readme-demo.gif" alt="HyperFrames demo — HTML code on the left transforms into a rendered video on the right" width="800">
 </p>
 
 Hyperframes is an open-source video rendering framework that lets you create, preview, and render HTML-based video compositions — with first-class support for AI agents.
@@ -32,6 +32,12 @@ npx skills add heygen-com/hyperframes
 ```
 
 This teaches your agent (Claude Code, Cursor, Gemini CLI, Codex) how to write correct compositions and GSAP animations. In Claude Code, the skills register as slash commands — invoke `/hyperframes` to author compositions, `/hyperframes-cli` for CLI commands, and `/gsap` for animation help.
+
+For Codex specifically, the same skills are also exposed as an [OpenAI Codex plugin](./.codex-plugin/plugin.json) — sparse-install just the plugin surface:
+
+```bash
+codex plugin marketplace add heygen-com/hyperframes --sparse .codex-plugin --sparse skills --sparse assets
+```
 
 #### Try it: example prompts
 
@@ -80,6 +86,26 @@ npx hyperframes render       # render to MP4
 - **AI-first** — agents already speak HTML. The CLI is non-interactive by default, designed for agent-driven workflows.
 - **Deterministic rendering** — same input = identical output. Built for automated pipelines.
 - **Frame Adapter pattern** — bring your own animation runtime (GSAP, Lottie, CSS, Three.js).
+
+## Hyperframes vs Remotion
+
+Hyperframes is inspired by [Remotion](https://www.remotion.dev) — we used Remotion at HeyGen in production, learned a ton from it, and kept attribution comments in the source for the patterns it pioneered (Chrome launch flags, image2pipe → FFmpeg streaming, frame buffering). Both tools drive headless Chrome and both are deterministic. They differ on one decision: **what the primary author writes.** Remotion's bet is React components; Hyperframes' bet is HTML.
+
+|                                                       | **Hyperframes**                | **Remotion**                      |
+| ----------------------------------------------------- | ------------------------------ | --------------------------------- |
+| Authoring                                             | HTML + CSS + GSAP              | React components (TSX)            |
+| Build step                                            | None; `index.html` plays as-is | Required (bundler)                |
+| Library-clock animations (GSAP, Anime.js, Motion One) | Seekable, frame-accurate       | Plays at wall-clock during render |
+| Arbitrary HTML / CSS passthrough                      | Paste and animate              | Rewrite as JSX                    |
+| Distributed rendering                                 | Single-machine today           | Lambda, production-ready          |
+
+### Licensing: fully open source vs source-available
+
+**Hyperframes is completely open source under [Apache 2.0](LICENSE)** — an OSI-approved license. Use it commercially at any scale, with no per-render fees, no seat caps, no company-size thresholds.
+
+**Remotion is [source-available, not open source](https://www.remotion.pro/license).** The code is on GitHub under a custom Remotion License that requires a paid company license above small-team thresholds. It's a great product with a real team behind it — but if open-source licensing matters to you (OSI compliance, redistribution rights, no per-use fees), that's a first-order decision point.
+
+Full write-up with benchmarks, an honest list of where each tool wins, and a GSAP side-by-side: **[Hyperframes vs Remotion guide](https://hyperframes.heygen.com/guides/hyperframes-vs-remotion)**.
 
 ## How It Works
 
@@ -153,16 +179,42 @@ HyperFrames ships [skills](https://github.com/vercel-labs/skills) that teach AI 
 npx skills add heygen-com/hyperframes
 ```
 
-| Skill                  | What it teaches                                                                              |
-| ---------------------- | -------------------------------------------------------------------------------------------- |
-| `hyperframes`          | HTML composition authoring, captions, TTS, audio-reactive animation, transitions             |
-| `hyperframes-cli`      | CLI commands: init, lint, preview, render, transcribe, tts, doctor                           |
-| `hyperframes-registry` | Block and component installation via `hyperframes add`                                       |
-| `gsap`                 | GSAP animation API, timelines, easing, ScrollTrigger, plugins, React/Vue/Svelte, performance |
+| Skill                    | What it teaches                                                                              |
+| ------------------------ | -------------------------------------------------------------------------------------------- |
+| `hyperframes`            | HTML composition authoring, captions, TTS, audio-reactive animation, transitions             |
+| `hyperframes-cli`        | CLI commands: init, lint, preview, render, transcribe, tts, doctor                           |
+| `hyperframes-registry`   | Block and component installation via `hyperframes add`                                       |
+| `website-to-hyperframes` | Capture a URL and turn it into a video — full website-to-video pipeline                      |
+| `gsap`                   | GSAP animation API, timelines, easing, ScrollTrigger, plugins, React/Vue/Svelte, performance |
 
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+### Cloning the repo
+
+The repo uses [Git LFS](https://git-lfs.com) for golden regression-test baselines under `packages/producer/tests/**/output.mp4` (~240 MB of `.mp4` files). If you're cloning the full repo for development, install Git LFS first:
+
+```bash
+# macOS
+brew install git-lfs
+
+# Ubuntu/Debian
+sudo apt install git-lfs
+
+# Windows
+winget install GitHub.GitLFS
+# (or install Git for Windows, which bundles Git LFS as an optional component)
+
+# Then (once, per machine)
+git lfs install
+```
+
+If you hit `git-lfs filter-process: command not found` during `git clone` or `npx skills add heygen-com/hyperframes`, install Git LFS and retry. You can also skip LFS content if you only need the source files:
+
+```bash
+GIT_LFS_SKIP_SMUDGE=1 git clone https://github.com/heygen-com/hyperframes.git
+```
 
 ## License
 

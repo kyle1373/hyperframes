@@ -17,6 +17,14 @@ function runSkillsAdd(repo: string): Promise<void> {
     const child = spawn("npx", ["skills", "add", repo, "--all"], {
       stdio: "inherit",
       timeout: 120_000,
+      // GH #316 — the upstream `skills` CLI shells out to `git clone`.
+      // When Git's clone-hook protection is active (shipped on by
+      // default in 2.45.1, reverted in 2.45.2, still present on many
+      // corporate and CI setups), any globally-registered
+      // `git lfs install` post-checkout hook aborts the clone. The
+      // `repo` reaching this function is hardcoded in SOURCES below
+      // — no user input reaches the spawn — so opting out here is safe.
+      env: { ...process.env, GIT_CLONE_PROTECTION_ACTIVE: "0" },
     });
     child.on("close", (code, signal) => {
       if (code === 0) resolve();

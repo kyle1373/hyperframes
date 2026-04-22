@@ -72,6 +72,13 @@ export interface ExtractedHtml {
 
 // ── Design Tokens ───────────────────────────────────────────────────────────
 
+export interface FontToken {
+  family: string;
+  weights: number[];
+  variable?: boolean;
+  weightRange?: [number, number];
+}
+
 export interface DesignTokens {
   /** Page title */
   title: string;
@@ -81,8 +88,8 @@ export interface DesignTokens {
   ogImage?: string;
   /** CSS custom properties from :root */
   cssVariables: Record<string, string>;
-  /** Font families in use */
-  fonts: string[];
+  /** Font families in use (with weights) */
+  fonts: FontToken[];
   /** Extracted colors (background, text, accent) */
   colors: string[];
   /** Headings with text and basic styles */
@@ -93,8 +100,6 @@ export interface DesignTokens {
     fontWeight: string;
     color: string;
   }>;
-  /** Paragraph text (first 10) */
-  paragraphs: string[];
   /** CTA button/link text */
   ctas: Array<{ text: string; href?: string }>;
   /** SVG elements with labels */
@@ -104,15 +109,6 @@ export interface DesignTokens {
     outerHTML: string;
     isLogo: boolean;
   }>;
-  /** Large images on the page */
-  images: Array<{
-    src: string;
-    alt: string;
-    width: number;
-    height: number;
-  }>;
-  /** Favicon/icon URLs */
-  icons: Array<{ rel: string; href: string }>;
   /** Detected page sections with bounding rects */
   sections: Array<{
     selector: string;
@@ -121,6 +117,7 @@ export interface DesignTokens {
     height: number;
     heading: string;
     backgroundColor?: string;
+    backgroundImage?: string;
   }>;
 }
 

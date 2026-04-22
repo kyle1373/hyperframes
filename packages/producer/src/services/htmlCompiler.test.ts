@@ -2,7 +2,12 @@ import { describe, expect, it, mock, beforeAll } from "bun:test";
 import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { collectExternalAssets, inlineExternalScripts } from "./htmlCompiler.js";
+import {
+  collectExternalAssets,
+  compileForRender,
+  detectRenderModeHints,
+  inlineExternalScripts,
+} from "./htmlCompiler.js";
 
 // ── collectExternalAssets ──────────────────────────────────────────────────
 
@@ -148,6 +153,26 @@ describe("inlineExternalScripts", () => {
     }
   });
 
+  it("preserves non-src script attributes when inlining", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = mock(
+      async () => new Response('console.log("module");', { status: 200 }),
+    ) as any;
+
+    try {
+      const html =
+        '<html><body><script type="module" data-role="boot" src="https://cdn.example.com/module.js"></script></body></html>';
+      const result = await inlineExternalScripts(html);
+
+      expect(result).toMatch(/<script\b[^>]*\btype="module"/);
+      expect(result).toMatch(/<script\b[^>]*\bdata-role="boot"/);
+      expect(result).toContain('console.log("module");');
+      expect(result).not.toContain('src="https://cdn.example.com/module.js"');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("escapes </script in downloaded content", async () => {
     const originalFetch = globalThis.fetch;
     globalThis.fetch = mock(
@@ -160,6 +185,45 @@ describe("inlineExternalScripts", () => {
       // Should escape </script to <\/script
       expect(result).not.toContain("</script><script>alert(1)</script>");
       expect(result).toContain("<\\/script");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("preserves literal replacement tokens in downloaded script content", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = mock(
+      async () =>
+        new Response('const before = "$`"; const after = "$\'"; const both = "$&";', {
+          status: 200,
+        }),
+    ) as any;
+
+    try {
+      const html = `<html><body><script src="https://cdn.example.com/d3.min.js"></script><div>tail</div></body></html>`;
+      const result = await inlineExternalScripts(html);
+
+      expect(result).toContain('const before = "$`";');
+      expect(result).toContain('const after = "$\'";');
+      expect(result).toContain('const both = "$&";');
+      expect(result.match(/<script>/g)?.length).toBe(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("returns a fragment when the input has no html/body wrapper", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = mock(async () => new Response("var d3 = {};", { status: 200 })) as any;
+
+    try {
+      const html = '<script src="https://cdn.example.com/d3.min.js"></script><div>tail</div>';
+      const result = await inlineExternalScripts(html);
+
+      expect(result).not.toMatch(/<!DOCTYPE|<html|<head|<body/i);
+      expect(result).toContain("var d3 = {};");
+      expect(result).toContain("<div>tail</div>");
+      expect(result).not.toContain('src="https://cdn.example.com/d3.min.js"');
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -219,10 +283,174 @@ describe("inlineExternalScripts", () => {
         <script src="https://cdn.example.com/gsap.min.js"></script>
       </body></html>`;
       const result = await inlineExternalScripts(html);
-      // Both should be found, both fetched
+      // Both identical script tags should be fetched and replaced independently.
       expect(fetchCount).toBe(2);
-      // At least one should be inlined (regex replaces first occurrence)
-      expect(result).toContain("var gsap = {};");
+      expect(
+        result.match(/\/\* inlined: https:\/\/cdn\.example\.com\/gsap\.min\.js \*\//g)?.length,
+      ).toBe(2);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+describe("detectRenderModeHints", () => {
+  it("recommends screenshot mode for iframe compositions", () => {
+    const html = `<!DOCTYPE html>
+<html><body>
+  <div data-composition-id="root" data-width="1920" data-height="1080">
+    <iframe src="./target.html"></iframe>
+  </div>
+</body></html>`;
+
+    const result = detectRenderModeHints(html);
+
+    expect(result.recommendScreenshot).toBe(true);
+    expect(result.reasons.map((reason) => reason.code)).toEqual(["iframe"]);
+  });
+
+  it("recommends screenshot mode for inline requestAnimationFrame loops", () => {
+    const html = `<!DOCTYPE html>
+<html><body>
+  <div data-composition-id="root" data-width="1920" data-height="1080"></div>
+  <script>
+    function tick() {
+      requestAnimationFrame(tick);
+    }
+    tick();
+  </script>
+</body></html>`;
+
+    const result = detectRenderModeHints(html);
+
+    expect(result.recommendScreenshot).toBe(true);
+    expect(result.reasons.map((reason) => reason.code)).toEqual(["requestAnimationFrame"]);
+  });
+
+  it("ignores requestAnimationFrame inside comments and external scripts", () => {
+    const html = `<!DOCTYPE html>
+<html><body>
+  <div data-composition-id="root" data-width="1920" data-height="1080"></div>
+  <script src="./runtime.js"></script>
+  <script>
+    // requestAnimationFrame(loop);
+    /* requestAnimationFrame(otherLoop); */
+    const label = "safe";
+  </script>
+</body></html>`;
+
+    const result = detectRenderModeHints(html);
+
+    expect(result.recommendScreenshot).toBe(false);
+    expect(result.reasons).toEqual([]);
+  });
+
+  it("ignores compiler-generated nested mount wrappers when detecting requestAnimationFrame", () => {
+    const html = `<!DOCTYPE html>
+<html><body>
+  <div data-composition-id="root" data-width="1920" data-height="1080"></div>
+  <script>
+    (function(){
+      var __compId = "intro";
+      var __run = function() {
+        const label = "safe";
+      };
+      if (!__compId) { __run(); return; }
+      /* __HF_COMPILER_MOUNT_START__ */
+      var __selector = '[data-composition-id="intro"]';
+      var __attempt = 0;
+      var __tryRun = function() {
+        if (document.querySelector(__selector)) { __run(); return; }
+        if (++__attempt >= 8) { __run(); return; }
+        requestAnimationFrame(__tryRun);
+      };
+      __tryRun();
+      /* __HF_COMPILER_MOUNT_END__ */
+    })();
+  </script>
+</body></html>`;
+
+    const result = detectRenderModeHints(html);
+
+    expect(result.recommendScreenshot).toBe(false);
+    expect(result.reasons).toEqual([]);
+  });
+
+  it("still flags user-authored requestAnimationFrame inside nested composition scripts", () => {
+    const html = `<!DOCTYPE html>
+<html><body>
+  <div data-composition-id="root" data-width="1920" data-height="1080"></div>
+  <script>
+    (function(){
+      var __compId = "intro";
+      var __run = function() {
+        function tick() {
+          requestAnimationFrame(tick);
+        }
+        tick();
+      };
+      if (!__compId) { __run(); return; }
+      /* __HF_COMPILER_MOUNT_START__ */
+      var __selector = '[data-composition-id="intro"]';
+      var __attempt = 0;
+      var __tryRun = function() {
+        if (document.querySelector(__selector)) { __run(); return; }
+        if (++__attempt >= 8) { __run(); return; }
+        requestAnimationFrame(__tryRun);
+      };
+      __tryRun();
+      /* __HF_COMPILER_MOUNT_END__ */
+    })();
+  </script>
+</body></html>`;
+
+    const result = detectRenderModeHints(html);
+
+    expect(result.recommendScreenshot).toBe(true);
+    expect(result.reasons.map((reason) => reason.code)).toEqual(["requestAnimationFrame"]);
+  });
+
+  it("does not recommend screenshot mode for nested compositions that hoist GSAP from a CDN script", async () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "hf-render-mode-"));
+    const compositionsDir = join(projectDir, "compositions");
+    mkdirSync(compositionsDir, { recursive: true });
+
+    writeFileSync(
+      join(projectDir, "index.html"),
+      `<!DOCTYPE html>
+<html><body>
+  <div data-composition-id="root" data-width="1920" data-height="1080">
+    <div data-composition-id="intro" data-composition-src="compositions/intro.html" data-start="0"></div>
+  </div>
+</body></html>`,
+    );
+    writeFileSync(
+      join(compositionsDir, "intro.html"),
+      `<template id="intro-template">
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+  <div data-composition-id="intro" data-width="1920" data-height="1080">
+    <div class="title">Hello</div>
+    <script>
+      window.__timelines = window.__timelines || {};
+      window.__timelines["intro"] = gsap.timeline({ paused: true });
+    </script>
+  </div>
+</template>`,
+    );
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = mock(async () => {
+      return new Response(
+        "window.gsap = { timeline: function() { return { paused: true }; } }; function __ticker(){ requestAnimationFrame(__ticker); }",
+        { status: 200 },
+      );
+    }) as any;
+
+    try {
+      const result = await compileForRender(projectDir, join(projectDir, "index.html"), projectDir);
+
+      expect(result.renderModeHints.recommendScreenshot).toBe(false);
+      expect(result.renderModeHints.reasons).toEqual([]);
     } finally {
       globalThis.fetch = originalFetch;
     }

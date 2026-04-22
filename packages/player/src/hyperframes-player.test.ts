@@ -211,6 +211,89 @@ describe("HyperframesPlayer parent-frame media", () => {
     expect(player._audioOwner).toBe("parent");
   });
 
+  it("dispatches audioownershipchange on promotion", () => {
+    player.setAttribute("audio-src", "https://cdn.example.com/narration.mp3");
+    document.body.appendChild(player);
+
+    const events: Array<{ owner: string; reason: string }> = [];
+    player.addEventListener("audioownershipchange", (e: Event) => {
+      const detail = (e as CustomEvent<{ owner: string; reason: string }>).detail;
+      events.push(detail);
+    });
+
+    player._promoteToParentProxy?.();
+    expect(events).toEqual([{ owner: "parent", reason: "autoplay-blocked" }]);
+
+    // Second promote is idempotent — no duplicate event.
+    player._promoteToParentProxy?.();
+    expect(events).toHaveLength(1);
+  });
+
+  it("promotion mid-playback plays parent proxy immediately", () => {
+    // Previously-missing coverage: if the user is already playing when
+    // the runtime reports autoplay-blocked, the proxy must start audible
+    // right away — not wait for the user to hit pause/play again.
+    player.setAttribute("audio-src", "https://cdn.example.com/narration.mp3");
+    document.body.appendChild(player);
+
+    player.play(); // `_paused = false`, owner still `runtime` → no parent play yet
+    expect(mockAudio.play).not.toHaveBeenCalled();
+
+    player._promoteToParentProxy?.();
+    expect(mockAudio.play).toHaveBeenCalled();
+  });
+
+  it("surfaces playbackerror when parent proxy play() rejects", async () => {
+    player.setAttribute("audio-src", "https://cdn.example.com/narration.mp3");
+    document.body.appendChild(player);
+
+    const rejection = Object.assign(new Error("blocked"), { name: "NotAllowedError" });
+    mockAudio.play = vi.fn().mockRejectedValueOnce(rejection);
+
+    const errors: unknown[] = [];
+    player.addEventListener("playbackerror", (e: Event) => {
+      errors.push((e as CustomEvent).detail);
+    });
+
+    player._promoteToParentProxy?.();
+    player.play();
+    // Promise rejection delivered on a microtask — flush.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(errors.length).toBeGreaterThan(0);
+    expect((errors[0] as { source: string }).source).toBe("parent-proxy");
+  });
+
+  it("playbackerror dedup: fires at most once per parent-ownership session", async () => {
+    // Under parent ownership with parent-also-blocked, every iframe
+    // paused→playing transition in the state loop re-invokes `_playParentMedia`.
+    // Without a latch, each rejection would re-fire `playbackerror`, spamming
+    // subscribers. Mirrors the runtime's `mediaAutoplayBlockedPosted` latch.
+    player.setAttribute("audio-src", "https://cdn.example.com/narration.mp3");
+    document.body.appendChild(player);
+
+    const rejection = Object.assign(new Error("blocked"), { name: "NotAllowedError" });
+    mockAudio.play = vi.fn().mockRejectedValue(rejection);
+
+    const errors: unknown[] = [];
+    player.addEventListener("playbackerror", (e: Event) => {
+      errors.push((e as CustomEvent).detail);
+    });
+
+    player._promoteToParentProxy?.();
+    player.play();
+    player.pause();
+    player.play();
+    player.pause();
+    player.play();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(errors).toHaveLength(1);
+  });
+
   it("cleans up parent media on disconnect", () => {
     player.setAttribute("audio-src", "https://cdn.example.com/narration.mp3");
     document.body.appendChild(player);

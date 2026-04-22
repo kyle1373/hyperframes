@@ -2,9 +2,20 @@ name: regression
 
 on:
   pull_request:
+    branches: [main]
   push:
     branches:
       - main
+
+concurrency:
+  group: regression-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege token: only reading code. Jobs that need more (e.g. GHA
+# cache reads/writes from docker/build-push-action with `type=gha`) elevate
+# their own permissions inline.
+permissions:
+  contents: read
 
 jobs:
   changes:
@@ -25,8 +36,53 @@ jobs:
               - "packages/engine/**"
               - "Dockerfile*"
 
-  regression-shards:
+  # Build the regression Docker image once, export it as a tarball, and upload
+  # as an artifact. Each matrix shard then downloads + `docker load`s it instead
+  # of rebuilding from cache. Measured on PR #419: the Docker build step takes
+  # ~4 min per shard even with GHA cache, so 11 shards = ~44 min of redundant
+  # build time per run. This job replaces that with a single ~4 min build plus
+  # ~15s of artifact download per shard.
+  build-image:
+    name: Build regression test image
     needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: write # docker/build-push-action `type=gha` cache reads + writes
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        # No LFS needed here — Dockerfile.test only copies source + package manifests,
+        # not the golden baselines under packages/producer/tests/**/output.
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build test image to tarball
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.test
+          tags: hyperframes-producer:test
+          cache-from: type=gha,scope=regression-test-image
+          cache-to: type=gha,mode=max,scope=regression-test-image
+          outputs: type=docker,dest=/tmp/regression-test-image.tar
+
+      - name: Report image size
+        run: ls -lh /tmp/regression-test-image.tar
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-test-image
+          path: /tmp/regression-test-image.tar
+          retention-days: 1
+          compression-level: 1
+
+  regression-shards:
+    needs: [changes, build-image]
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -35,7 +91,11 @@ jobs:
       matrix:
         include:
           - shard: fast
-            args: "--sequential --exclude-tags slow"
+            args: "--sequential --exclude-tags slow,render-compat,hdr"
+          - shard: render-compat
+            args: "--sequential gsap-letters-render-compat css-spinner-render-compat raf-ball-render-compat iframe-render-compat"
+          - shard: hdr
+            args: "--sequential hdr-pq hdr-image-only"
           - shard: styles-a
             args: "style-1-prod style-2-prod style-3-prod"
           - shard: styles-b
@@ -70,18 +130,16 @@ jobs:
             fi
           done
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build test Docker image (cached)
-        uses: docker/build-push-action@v6
+      - name: Download test image artifact
+        uses: actions/download-artifact@v4
         with:
-          context: .
-          file: Dockerfile.test
-          load: true
-          tags: hyperframes-producer:test
-          cache-from: type=gha,scope=regression-test-image
-          cache-to: type=gha,mode=max,scope=regression-test-image
+          name: regression-test-image
+          path: /tmp
+
+      - name: Load test image
+        run: |
+          docker load -i /tmp/regression-test-image.tar
+          docker image ls hyperframes-producer:test
 
       - name: "Run regression shard: ${{ matrix.shard }}"
         run: |

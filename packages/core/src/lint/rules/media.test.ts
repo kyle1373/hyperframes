@@ -89,4 +89,21 @@ describe("media rules", () => {
     expect(finding).toBeDefined();
     expect(finding?.severity).toBe("error");
   });
+
+  it("does NOT flag <video> as nested in a void element with data-start (regression)", () => {
+    // Regression: void elements like <img> have no closing tag, so the previous
+    // implementation kept them on the parent stack indefinitely and flagged any
+    // later <video> with data-start as "nested" inside them.
+    const html = `
+<html><body>
+  <div id="root" data-composition-id="c1" data-width="1920" data-height="1080">
+    <img id="hdr-img" src="hdr.png" data-start="0" data-duration="5" data-track-index="0" />
+    <video id="hdr-vid" src="clip.mp4" data-start="5" data-duration="5" data-track-index="1" muted playsinline></video>
+  </div>
+  <script>window.__timelines = window.__timelines || {}; window.__timelines["c1"] = gsap.timeline({ paused: true });</script>
+</body></html>`;
+    const result = lintHyperframeHtml(html);
+    const finding = result.findings.find((f) => f.code === "video_nested_in_timed_element");
+    expect(finding).toBeUndefined();
+  });
 });

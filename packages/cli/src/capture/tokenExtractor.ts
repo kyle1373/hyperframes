@@ -41,12 +41,49 @@ const EXTRACT_SCRIPT = `(() => {
   var ogImgEl = document.querySelector('meta[property="og:image"]');
   var ogImage = ogImgEl ? ogImgEl.content : undefined;
 
-  // 3. Fonts
-  var fontSet = {};
-  var fontSamples = [document.body, document.querySelector("h1"), document.querySelector("h2"), document.querySelector("p"), document.querySelector("button")].filter(Boolean);
-  for (var fi = 0; fi < fontSamples.length; fi++) {
-    var family = getComputedStyle(fontSamples[fi]).fontFamily.split(",")[0].replace(/['"]/g, "").trim();
-    if (family && ["serif","sans-serif","monospace","cursive"].indexOf(family) === -1) fontSet[family] = true;
+  // 3. Fonts — enumerate loaded FontFaces + supplement with DOM sampling
+  var fontMap = {};
+  function ensureFont(name) {
+    if (!fontMap[name]) fontMap[name] = { family: name, weights: [], variable: false, weightRange: undefined };
+    return fontMap[name];
+  }
+  function addWeight(entry, w) {
+    var n = parseInt(w, 10);
+    if (!isNaN(n) && entry.weights.indexOf(n) === -1) entry.weights.push(n);
+  }
+  var genericFonts = ["serif","sans-serif","monospace","cursive","system-ui","ui-serif","ui-sans-serif","ui-monospace","ui-rounded","emoji","math","fangsong"];
+  try {
+    document.fonts.forEach(function(face) {
+      var name = face.family.replace(/['"]/g, "").trim();
+      if (!name || genericFonts.indexOf(name.toLowerCase()) !== -1) return;
+      // Skip placeholder/fallback fonts (Framer loads hundreds of these)
+      if (name.indexOf("Placeholder") !== -1 || name.indexOf("Fallback") !== -1) return;
+      var entry = ensureFont(name);
+      var w = (face.weight || "").trim();
+      if (w.indexOf(" ") !== -1) {
+        var parts = w.split(" ");
+        var lo = parseInt(parts[0], 10);
+        var hi = parseInt(parts[1], 10);
+        if (!isNaN(lo) && !isNaN(hi)) {
+          entry.variable = true;
+          entry.weightRange = [lo, hi];
+        }
+      } else {
+        addWeight(entry, w);
+      }
+    });
+  } catch(e) {}
+  // Supplement with DOM sampling
+  var domSamples = Array.from(document.querySelectorAll("h1,h2,h3,h4,h5,h6,p,a,button,span,li,strong,b")).slice(0, 100);
+  for (var fi = 0; fi < domSamples.length; fi++) {
+    try {
+      var cs = getComputedStyle(domSamples[fi]);
+      var family = cs.fontFamily.split(",")[0].replace(/['"]/g, "").trim();
+      if (family && genericFonts.indexOf(family.toLowerCase()) === -1) {
+        var entry = ensureFont(family);
+        addWeight(entry, cs.fontWeight);
+      }
+    } catch(e) {}
   }
 
   // 4. Colors — hybrid: DOM computed styles + visual pixel sampling
@@ -204,10 +241,7 @@ const EXTRACT_SCRIPT = `(() => {
     return { level: parseInt(h.tagName[1]), text: (h.innerText || h.textContent || "").trim().replace(/\\s+/g, ' ').slice(0, 200), fontSize: s.fontSize, fontWeight: s.fontWeight, color: rgbToHex(s.color) || s.color };
   });
 
-  // 6. Paragraphs
-  var paragraphs = Array.from(document.querySelectorAll("p")).slice(0, 10).map(function(p) { return (p.textContent || "").trim().slice(0, 300); }).filter(function(t) { return t.length > 20; });
-
-  // 7. CTAs — match by class AND by text content patterns
+  // 6. CTAs — match by class AND by text content patterns
   // Conservative class selectors (avoid nav links with "action" or "start" in class)
   var ctaSelectors = 'a[class*="btn"], a[class*="button"], a[class*="cta"], button[class*="primary"], button[class*="cta"], [role="button"]';
   var ctaEls = Array.from(document.querySelectorAll(ctaSelectors));
@@ -278,15 +312,7 @@ const EXTRACT_SCRIPT = `(() => {
     };
   }).filter(Boolean).slice(0, 50);
 
-  // 9. Images
-  var imgEls = Array.from(document.querySelectorAll("img[src]")).filter(function(img) { return img.naturalWidth > 200 && isVisible(img); }).slice(0, 15);
-  var images = imgEls.map(function(img) { return { src: img.src, alt: img.alt || "", width: img.naturalWidth, height: img.naturalHeight }; });
-
-  // 10. Icons
-  var iconEls = Array.from(document.querySelectorAll('link[rel*="icon"], link[rel="apple-touch-icon"]'));
-  var icons = iconEls.map(function(l) { return { rel: l.rel, href: l.href }; });
-
-  // 11. Sections — find large visual blocks regardless of HTML tag
+  // 9. Sections — find large visual blocks regardless of HTML tag
   var sectionResults = [];
   // Start with semantic elements, then fall back to large direct children of body/main
   var candidates = Array.from(document.querySelectorAll(
@@ -336,17 +362,45 @@ const EXTRACT_SCRIPT = `(() => {
       }
       if (!sectionBg || sectionBg === "rgba(0, 0, 0, 0)" || sectionBg === "transparent") sectionBg = "#FFFFFF";
     }
+    // Check for background-image when color is transparent/default white
+    var sectionBgImage = undefined;
+    var rawBgImg = getComputedStyle(el).backgroundImage;
+    if (rawBgImg && rawBgImg !== "none" && rawBgImg.indexOf("url(") !== -1) {
+      var start = rawBgImg.indexOf("url(") + 4;
+      var end = rawBgImg.indexOf(")", start);
+      if (end > start) {
+        sectionBgImage = rawBgImg.slice(start, end).replace(/['"]/g, "");
+      }
+    }
     sectionBg = rgbToHex(sectionBg) || sectionBg;
-    sectionResults.push({ selector: selector, type: type, y: Math.round(y), height: Math.round(rect.height), heading: headingText, backgroundColor: sectionBg });
+    var sectionEntry = { selector: selector, type: type, y: Math.round(y), height: Math.round(rect.height), heading: headingText, backgroundColor: sectionBg };
+    if (sectionBgImage) sectionEntry.backgroundImage = sectionBgImage;
+    sectionResults.push(sectionEntry);
   }
   sectionResults.sort(function(a, b) { return a.y - b.y; });
   var filtered = sectionResults.filter(function(s, i) { return i === 0 || Math.abs(s.y - sectionResults[i-1].y) > 100; });
 
+  // Filter cssVariables — keep only color-like values or design-relevant names
+  var colorValueRe = /^(#|rgb|hsl|oklch|oklab|lch|lab|color)/i;
+  var designNameRe = /(color|bg|background|border|text|font|radius|shadow)/i;
+  var filteredVars = {};
+  var varKeys = Object.keys(cssVariables);
+  for (var vi = 0; vi < varKeys.length; vi++) {
+    var varName = varKeys[vi];
+    var varVal = cssVariables[varName];
+    if (colorValueRe.test(varVal) || designNameRe.test(varName)) {
+      filteredVars[varName] = varVal;
+    }
+  }
+
+  // Filter sections — only keep those with a non-empty heading
+  var filteredSections = filtered.filter(function(s) { return s.heading && s.heading.length > 0; });
+
   return {
     title: title, description: description, ogImage: ogImage,
-    cssVariables: cssVariables, fonts: Object.keys(fontSet), colors: Object.keys(colorSet).sort(function(a,b) { return colorSet[b] - colorSet[a]; }).slice(0, 20),
-    headings: headings, paragraphs: paragraphs, ctas: ctas,
-    svgs: svgs, images: images, icons: icons, sections: filtered
+    cssVariables: filteredVars, fonts: Object.keys(fontMap).map(function(k) { var f = fontMap[k]; f.weights.sort(function(a,b){return a-b;}); return f; }).filter(function(f) { return f.weights.length > 0 || f.variable; }).slice(0, 20), colors: Object.keys(colorSet).sort(function(a,b) { return colorSet[b] - colorSet[a]; }).slice(0, 20),
+    headings: headings, ctas: ctas,
+    svgs: svgs, sections: filteredSections
   };
 })()`;
 

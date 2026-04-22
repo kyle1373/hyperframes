@@ -69,9 +69,14 @@
           {
             "group": "Guides",
             "pages": [
+              "guides/website-to-video",
               "guides/prompting",
+              "guides/hyperframes-vs-remotion",
               "guides/gsap-animation",
               "guides/rendering",
+              "guides/hdr",
+              "guides/performance",
+              "guides/timeline-editing",
               "guides/common-mistakes",
               "guides/troubleshooting"
             ]

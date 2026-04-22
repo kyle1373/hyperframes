@@ -93,13 +93,18 @@ export function syncRuntimeMedia(params: {
   playing: boolean;
   playbackRate: number;
   /**
-   * When `true`, assert `el.muted = true` on every active media element on
-   * every tick. Sticky against newly-discovered media (sub-composition
-   * activation, dynamic DOM) so the parent-frame audio-owner invariant holds.
-   * `false` is a no-op — we don't un-mute, because other code paths
-   * (`<audio muted>` author intent, `onSetMuted`) own the un-mute decision.
+   * Parent-frame audio-owner has taken over audible playback. Assert
+   * `el.muted = true` on every active media element per tick so that any
+   * sub-composition media inserted mid-playback inherits the silence.
    */
   outputMuted?: boolean;
+  /**
+   * User's explicit mute preference (set via `onSetMuted`). Symmetric to
+   * `outputMuted` — also asserted per tick — so a sub-composition that
+   * activates after the user mutes doesn't briefly play at author volume
+   * before the next bridge message lands.
+   */
+  userMuted?: boolean;
   /**
    * Invoked at most once when a media element's `play()` promise rejects with
    * `NotAllowedError`. The caller is expected to latch and post a single
@@ -107,6 +112,9 @@ export function syncRuntimeMedia(params: {
    */
   onAutoplayBlocked?: () => void;
 }): void {
+  // Either flag silences output. Combined up front so the per-clip loop is
+  // a single branch instead of two.
+  const shouldMute = !!(params.outputMuted || params.userMuted);
   for (const clip of params.clips) {
     const { el } = clip;
     if (!el.isConnected) continue;
@@ -122,7 +130,7 @@ export function syncRuntimeMedia(params: {
         }
       }
       if (clip.volume != null) el.volume = clip.volume;
-      if (params.outputMuted) el.muted = true;
+      if (shouldMute) el.muted = true;
       try {
         // Per-element rate × global transport rate
         el.playbackRate = clip.playbackRate * params.playbackRate;

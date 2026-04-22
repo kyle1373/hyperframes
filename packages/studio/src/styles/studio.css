@@ -13,7 +13,18 @@ body {
 
 #root {
   width: 100vw;
+  /*
+   * 100vh on iOS Safari measures the LARGEST viewport (toolbars hidden) and
+   * stays fixed at that value, so when the toolbar is visible the bottom of
+   * the layout sits *under* it and anything at flex-end — the player
+   * controls row, notably — becomes untappable. `100dvh` follows the
+   * dynamic viewport, shrinking when the toolbar is shown so the bottom of
+   * #root lines up with the bottom of the visible area. Fallback to 100vh
+   * keeps older browsers (pre-Safari 15.4 / Firefox 101 / Chrome 108) on
+   * the existing behaviour.
+   */
   height: 100vh;
+  height: 100dvh;
 }
 
 /* CodeMirror overrides */

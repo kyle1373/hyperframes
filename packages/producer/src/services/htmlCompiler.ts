@@ -24,9 +24,12 @@ import {
   rewriteCssAssetUrls,
 } from "@hyperframes/core";
 import { extractVideoMetadata, extractAudioMetadata } from "../utils/ffprobe.js";
+import { isPathInside, toExternalAssetKey } from "../utils/paths.js";
 import {
   parseVideoElements,
+  parseImageElements,
   type VideoElement,
+  type ImageElement,
   parseAudioElements,
   type AudioElement,
   analyzeKeyframeIntervals,
@@ -40,12 +43,26 @@ export interface CompiledComposition {
   subCompositions: Map<string, string>;
   videos: VideoElement[];
   audios: AudioElement[];
+  images: ImageElement[];
   unresolvedCompositions: UnresolvedElement[];
   /** Assets that resolve outside projectDir. Keys are the path used in HTML, values are absolute filesystem paths. */
   externalAssets: Map<string, string>;
   width: number;
   height: number;
   staticDuration: number;
+  renderModeHints: RenderModeHints;
+}
+
+export type RenderModeHintCode = "iframe" | "requestAnimationFrame";
+
+export interface RenderModeHint {
+  code: RenderModeHintCode;
+  message: string;
+}
+
+export interface RenderModeHints {
+  recommendScreenshot: boolean;
+  reasons: RenderModeHint[];
 }
 
 function dedupeElementsById<T extends { id: string }>(elements: T[]): T[] {
@@ -54,6 +71,57 @@ function dedupeElementsById<T extends { id: string }>(elements: T[]): T[] {
     deduped.set(element.id, element);
   }
   return Array.from(deduped.values());
+}
+
+const INLINE_SCRIPT_PATTERN = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
+const COMPILER_MOUNT_BLOCK_START = "/* __HF_COMPILER_MOUNT_START__ */";
+const COMPILER_MOUNT_BLOCK_END = "/* __HF_COMPILER_MOUNT_END__ */";
+
+function stripJsComments(source: string): string {
+  return source.replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
+}
+
+function stripCompilerMountBootstrap(source: string): string {
+  return source.replace(
+    new RegExp(
+      `${COMPILER_MOUNT_BLOCK_START.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[\\s\\S]*?${COMPILER_MOUNT_BLOCK_END.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`,
+      "g",
+    ),
+    "",
+  );
+}
+
+export function detectRenderModeHints(html: string): RenderModeHints {
+  const reasons: RenderModeHint[] = [];
+  const { document } = parseHTML(html);
+
+  if (document.querySelector("iframe")) {
+    reasons.push({
+      code: "iframe",
+      message:
+        "Detected <iframe> in the composition DOM. Nested iframe animation is routed through screenshot capture mode for compatibility.",
+    });
+  }
+
+  let scriptMatch: RegExpExecArray | null;
+  const scriptPattern = new RegExp(INLINE_SCRIPT_PATTERN.source, INLINE_SCRIPT_PATTERN.flags);
+  while ((scriptMatch = scriptPattern.exec(html)) !== null) {
+    const attrs = scriptMatch[1] || "";
+    if (/\bsrc\s*=/i.test(attrs)) continue;
+    const content = stripJsComments(stripCompilerMountBootstrap(scriptMatch[2] || ""));
+    if (!/requestAnimationFrame\s*\(/.test(content)) continue;
+    reasons.push({
+      code: "requestAnimationFrame",
+      message:
+        "Detected raw requestAnimationFrame() in an inline script. This render is routed through screenshot capture mode with virtual time enabled.",
+    });
+    break;
+  }
+
+  return {
+    recommendScreenshot: reasons.length > 0,
+    reasons,
+  };
 }
 
 async function resolveMediaDuration(
@@ -175,10 +243,12 @@ async function parseSubCompositions(
 ): Promise<{
   videos: VideoElement[];
   audios: AudioElement[];
+  images: ImageElement[];
   subCompositions: Map<string, string>;
 }> {
   const videos: VideoElement[] = [];
   const audios: AudioElement[] = [];
+  const images: ImageElement[] = [];
   const subCompositions = new Map<string, string>();
 
   const { document } = parseHTML(html);
@@ -243,6 +313,7 @@ async function parseSubCompositions(
 
       const subVideos = parseVideoElements(compiledSub);
       const subAudios = parseAudioElements(compiledSub);
+      const subImages = parseImageElements(compiledSub);
 
       return {
         srcPath: item.srcPath,
@@ -250,6 +321,7 @@ async function parseSubCompositions(
         nested,
         subVideos,
         subAudios,
+        subImages,
         absoluteStart: item.absoluteStart,
         absoluteEnd: item.absoluteEnd,
       };
@@ -265,6 +337,7 @@ async function parseSubCompositions(
     }
     videos.push(...r.nested.videos);
     audios.push(...r.nested.audios);
+    images.push(...r.nested.images);
 
     for (const v of r.subVideos) {
       v.start += r.absoluteStart;
@@ -288,16 +361,29 @@ async function parseSubCompositions(
       }
     }
 
+    for (const img of r.subImages) {
+      img.start += r.absoluteStart;
+      img.end += r.absoluteStart;
+      if (img.end > r.absoluteEnd) {
+        img.end = r.absoluteEnd;
+      }
+      if (img.start < r.absoluteEnd) {
+        images.push(img);
+      }
+    }
+
     if (
       r.subVideos.length > 0 ||
       r.subAudios.length > 0 ||
+      r.subImages.length > 0 ||
       r.nested.videos.length > 0 ||
-      r.nested.audios.length > 0
+      r.nested.audios.length > 0 ||
+      r.nested.images.length > 0
     ) {
     }
   }
 
-  return { videos, audios, subCompositions };
+  return { videos, audios, images, subCompositions };
 }
 
 /**
@@ -590,6 +676,7 @@ function inlineSubCompositions(
     }
   };
   if (!__compId) { __run(); return; }
+  ${COMPILER_MOUNT_BLOCK_START}
   var __selector = '[data-composition-id="' + (__compId + '').replace(/"/g, '\\\\"') + '"]';
   var __attempt = 0;
   var __tryRun = function() {
@@ -598,6 +685,7 @@ function inlineSubCompositions(
     requestAnimationFrame(__tryRun);
   };
   __tryRun();
+  ${COMPILER_MOUNT_BLOCK_END}
 })()`);
       }
       scriptEl.remove();
@@ -724,7 +812,9 @@ function ensureFullDocument(html: string): string {
  * works without network access (Docker, CI, restricted environments).
  */
 export async function inlineExternalScripts(html: string): Promise<string> {
-  const { document } = parseHTML(html);
+  const fullHtml = ensureFullDocument(html);
+  const wrappedFragment = fullHtml !== html;
+  const { document } = parseHTML(fullHtml);
   const scripts = document.querySelectorAll("script[src]");
   const externalScripts: { el: Element; src: string }[] = [];
 
@@ -747,21 +837,21 @@ export async function inlineExternalScripts(html: string): Promise<string> {
     }),
   );
 
-  let result = html;
   for (let i = 0; i < downloads.length; i++) {
     const download = downloads[i]!;
-    const { src } = externalScripts[i]!;
+    const { el, src } = externalScripts[i]!;
     if (download.status === "fulfilled") {
-      const escapedSrc = src.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const scriptTagRe = new RegExp(
-        `<script\\b[^>]*\\bsrc=["']${escapedSrc}["'][^>]*>\\s*</script>`,
-        "is",
-      );
       // Escape </script in downloaded content to prevent premature tag closure.
       // <\/script is safe: the HTML parser doesn't recognize it as a close tag,
       // but JS treats \/ as / so the code executes identically.
       const safeText = download.value.text.replace(/<\/script/gi, "<\\/script");
-      result = result.replace(scriptTagRe, `<script>/* inlined: ${src} */\n${safeText}\n</script>`);
+      const inlineScript = document.createElement("script");
+      for (const attr of Array.from(el.attributes)) {
+        if (attr.name.toLowerCase() === "src") continue;
+        inlineScript.setAttribute(attr.name, attr.value);
+      }
+      inlineScript.textContent = `/* inlined: ${src} */\n${safeText}\n`;
+      el.replaceWith(inlineScript);
       console.log(`[Compiler] Inlined CDN script: ${src}`);
     } else {
       console.warn(
@@ -772,7 +862,7 @@ export async function inlineExternalScripts(html: string): Promise<string> {
     }
   }
 
-  return result;
+  return wrappedFragment ? document.body.innerHTML || "" : document.toString();
 }
 
 /**
@@ -804,12 +894,14 @@ export function collectExternalAssets(
       return null;
     }
     const absPath = resolve(absProjectDir, trimmed);
-    if (absPath.startsWith(absProjectDir + "/") || absPath === absProjectDir) {
+    if (isPathInside(absPath, absProjectDir)) {
       return null; // inside projectDir, file server handles this
     }
     if (!existsSync(absPath)) return null;
-    // resolve() already canonicalizes the path (no .. components remain)
-    const safeKey = "hf-ext/" + absPath.replace(/^\//, "");
+    // resolve() already canonicalises the path (no .. components remain);
+    // toExternalAssetKey() produces a cross-platform relative key that
+    // `path.join(compileDir, key)` cannot escape on any OS.
+    const safeKey = toExternalAssetKey(absPath);
     externalAssets.set(safeKey, absPath);
     return safeKey;
   }
@@ -882,6 +974,7 @@ export async function compileForRender(
   const {
     videos: subVideos,
     audios: subAudios,
+    images: subImages,
     subCompositions,
   } = await parseSubCompositions(compiledHtml, projectDir, downloadDir);
 
@@ -904,6 +997,7 @@ export async function compileForRender(
     /(<(?:video|audio)\b[^>]*?)\s+preload\s*=\s*["']none["']/gi,
     "$1",
   );
+  const renderModeHints = detectRenderModeHints(sanitizedHtml);
 
   const coalescedHtml = await injectDeterministicFontFaces(
     coalesceHeadStylesAndBodyScripts(promoteCssImportsToLinkTags(sanitizedHtml)),
@@ -924,12 +1018,14 @@ export async function compileForRender(
   // Parse main HTML elements
   const mainVideos = parseVideoElements(html);
   const mainAudios = parseAudioElements(html);
+  const mainImages = parseImageElements(html);
 
   // Keep inlined sub-composition media authoritative on ID collisions.
   // inlineSubCompositions() hoists those nodes into the final HTML, so the
   // producer should follow the same precedence the runtime sees in the merged DOM.
   const videos = dedupeElementsById([...mainVideos, ...subVideos]);
   const audios = dedupeElementsById([...mainAudios, ...subAudios]);
+  const images = dedupeElementsById([...mainImages, ...subImages]);
 
   // Advisory video checks (sparse keyframes, VFR). Fire-and-forget — these spawn
   // ffprobe subprocesses and should not block compilation since they only produce warnings.
@@ -946,9 +1042,10 @@ export async function compileForRender(
           );
         }
         if (metadata.isVFR) {
-          console.warn(
-            `[Compiler] WARNING: Video "${video.id}" is variable frame rate (VFR). ` +
-              `Screen recordings and phone videos are often VFR, which causes stuttering and frame skipping in renders. Re-encode with: ${reencode}`,
+          console.info(
+            `[Compiler] Video "${video.id}" is variable frame rate (VFR); ` +
+              `the engine will normalize it to CFR before frame extraction. ` +
+              `If rendering feels slow on this video, pre-encode once with: ${reencode}`,
           );
         }
       })
@@ -976,11 +1073,13 @@ export async function compileForRender(
     subCompositions,
     videos,
     audios,
+    images,
     unresolvedCompositions,
     externalAssets,
     width,
     height,
     staticDuration,
+    renderModeHints,
   };
 }
 
@@ -1125,15 +1224,18 @@ export async function recompileWithResolutions(
   const {
     videos: subVideos,
     audios: subAudios,
+    images: subImages,
     subCompositions,
   } = await parseSubCompositions(html, projectDir, downloadDir);
 
   const mainVideos = parseVideoElements(html);
   const mainAudios = parseAudioElements(html);
+  const mainImages = parseImageElements(html);
 
   // Keep inlined sub-composition media authoritative on ID collisions.
   const videos = dedupeElementsById([...mainVideos, ...subVideos]);
   const audios = dedupeElementsById([...mainAudios, ...subAudios]);
+  const images = dedupeElementsById([...mainImages, ...subImages]);
 
   const remaining = compiled.unresolvedCompositions.filter(
     (c) => !resolutions.some((r) => r.id === c.id),
@@ -1145,6 +1247,8 @@ export async function recompileWithResolutions(
     subCompositions,
     videos,
     audios,
+    images,
     unresolvedCompositions: remaining,
+    renderModeHints: compiled.renderModeHints,
   };
 }

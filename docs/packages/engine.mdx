@@ -278,6 +278,75 @@ const server = await createFileServer({ root: './my-video', port: 0 });
 await server.close();
 ```
 
+## HDR APIs
+
+The engine exports two layers of HDR support: **color-space utilities** that classify sources and configure the FFmpeg encoder, and a **WebGPU readback runtime** for capturing CSS-animated DOM directly into HDR.
+
+For end-to-end HDR rendering (HDR video and image sources composited into an HDR10 MP4) use the [producer](/packages/producer) or the CLI's `--hdr` flag — see [HDR Rendering](/guides/hdr). The APIs below are for custom integrations.
+
+### Color space utilities
+
+```typescript
+import {
+  isHdrColorSpace,
+  detectTransfer,
+  analyzeCompositionHdr,
+  getHdrEncoderColorParams,
+  DEFAULT_HDR10_MASTERING,
+} from '@hyperframes/engine';
+import type { HdrTransfer, HdrEncoderColorParams, HdrMasteringMetadata } from '@hyperframes/engine';
+
+// Classify a single source from its ffprobe color space
+isHdrColorSpace(colorSpace);          // boolean — true for BT.2020 / PQ / HLG
+detectTransfer(colorSpace);           // 'pq' | 'hlg' (gate on isHdrColorSpace first)
+
+// Pick the dominant transfer across many sources
+analyzeCompositionHdr([cs1, cs2]);    // { hasHdr, dominantTransfer: 'pq' | 'hlg' | null }
+
+// Build the FFmpeg color params + HDR10 static metadata for x265
+const params = getHdrEncoderColorParams('pq');
+// {
+//   colorPrimaries: 'bt2020',
+//   colorTrc: 'smpte2084',
+//   colorspace: 'bt2020nc',
+//   pixelFormat: 'yuv420p10le',
+//   x265ColorParams: 'colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=...:max-cll=1000,400',
+//   mastering: { masterDisplay: '...', maxCll: '1000,400' },
+// }
+```
+
+`getHdrEncoderColorParams` always includes both color tagging *and* the HDR10 static metadata (mastering display + content light level). Without that metadata, downstream players treat the file as SDR BT.2020 and tone-map incorrectly. Pass a custom `HdrMasteringMetadata` if you have measured per-content values; otherwise the conservative `DEFAULT_HDR10_MASTERING` defaults match how most HDR10 grading suites tag content.
+
+### WebGPU HDR DOM capture
+
+For capturing CSS-animated DOM directly into HDR (no FFmpeg source involved), the engine exposes a separate WebGPU pipeline:
+
+```typescript
+import {
+  launchHdrBrowser,
+  buildHdrChromeArgs,
+  initHdrReadback,
+  uploadAndReadbackHdrFrame,
+  float16ToPqRgb,
+} from '@hyperframes/engine';
+
+// Launch headed Chrome with WebGPU enabled
+const { browser, page } = await launchHdrBrowser({ width: 1920, height: 1080 });
+
+// Inject the WebGPU readback runtime
+const ok = await initHdrReadback(page, 1920, 1080);
+
+// For each frame: upload float16 pixels, read back float16 RGBA
+const { rgba16, bytesPerRow } = await uploadAndReadbackHdrFrame(page, float16Base64);
+
+// Convert linear float16 → PQ-encoded 16-bit RGB suitable for piping into ffmpeg/x265
+const pqRgb = float16ToPqRgb(rgba16, width, height, bytesPerRow);
+```
+
+<Warning>
+  This path requires **headed Chrome with `--enable-unsafe-webgpu`** — WebGPU is unavailable in `chrome-headless-shell`. It is *not* used by the default `--hdr` render pipeline (which extracts HDR pixels from sources via FFmpeg and composites in Node). Use it only for advanced custom pipelines that need CSS animations driving HDR pixel output.
+</Warning>
+
 ## The `window.__hf` Protocol
 
 The engine communicates with the browser page via the `window.__hf` protocol. Any page that implements this protocol can be captured by the engine — you are not limited to Hyperframes compositions.

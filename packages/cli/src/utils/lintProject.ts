@@ -53,6 +53,8 @@ export function lintProject(project: ProjectDir): ProjectLintResult {
   const projectFindings = [
     ...lintProjectAudioFiles(project.dir, allHtmlSources),
     ...lintAudioSrcNotFound(project.dir, allHtmlSources),
+    ...lintMultipleRootCompositions(project.dir),
+    ...lintDuplicateAudioTracks(allHtmlSources),
   ];
   if (projectFindings.length > 0) {
     // Append project-level findings to the root index.html result
@@ -107,7 +109,7 @@ function lintProjectAudioFiles(projectDir: string, htmlSources: string[]): Hyper
       fixHint:
         'Add an <audio id="my-audio" src="' +
         audioFiles[0] +
-        '" data-start="0" data-track-index="0" data-volume="1"></audio> element inside the composition root.',
+        '" data-start="0" data-duration="__DURATION__" data-track-index="0" data-volume="1"></audio> element inside the composition root. Replace __DURATION__ with the audio length in seconds.',
     });
   }
 
@@ -151,6 +153,98 @@ function lintAudioSrcNotFound(projectDir: string, htmlSources: string[]): Hyperf
     });
   }
 
+  return findings;
+}
+
+/**
+ * Error if multiple root-level HTML files with data-composition-id exist.
+ * Scans the project directory filesystem (not just what lintProject chose to read)
+ * to catch stray scaffold files, duplicates, or backup copies.
+ */
+function lintMultipleRootCompositions(projectDir: string): HyperframeLintFinding[] {
+  const findings: HyperframeLintFinding[] = [];
+  try {
+    const rootHtmlFiles = readdirSync(projectDir).filter((f) => f.endsWith(".html"));
+    const rootCompositions: string[] = [];
+    for (const file of rootHtmlFiles) {
+      const content = readFileSync(join(projectDir, file), "utf-8");
+      if (/data-composition-id/i.test(content)) {
+        rootCompositions.push(file);
+      }
+    }
+    if (rootCompositions.length > 1) {
+      findings.push({
+        code: "multiple_root_compositions",
+        severity: "error",
+        message: `Multiple root-level HTML files with data-composition-id: ${rootCompositions.join(", ")}. The runtime may discover both as entry points, causing duplicate audio playback.`,
+        fixHint:
+          "A project should have exactly one root index.html with data-composition-id. Remove or rename extra files.",
+      });
+    }
+  } catch {
+    /* directory read failed — skip */
+  }
+  return findings;
+}
+
+/**
+ * Warn if multiple <audio> elements on the same data-track-index overlap in time.
+ * Extracts each attribute independently (order-insensitive) to handle any HTML attribute order.
+ * Deduplicates by (src, start, duration) to avoid flagging the same audio reached via sub-compositions.
+ */
+function lintDuplicateAudioTracks(htmlSources: string[]): HyperframeLintFinding[] {
+  const findings: HyperframeLintFinding[] = [];
+  function extractAttr(tag: string, name: string): string | null {
+    const re = new RegExp(`\\b${name}\\s*=\\s*["']([^"']+)["']`, "i");
+    const m = tag.match(re);
+    return m?.[1] ?? null;
+  }
+
+  const tracks: Array<{ trackIndex: number; start: number; end: number; src: string }> = [];
+  const seen = new Set<string>();
+
+  for (const html of htmlSources) {
+    // Regex with g flag must be created inside the loop — a shared g-regex
+    // carries lastIndex across strings, silently skipping matches.
+    const audioTagRe = /<audio\b[^>]*>/gi;
+    let match: RegExpExecArray | null;
+    while ((match = audioTagRe.exec(html)) !== null) {
+      const tag = match[0];
+      const trackStr = extractAttr(tag, "data-track-index");
+      const startStr = extractAttr(tag, "data-start");
+      const durStr = extractAttr(tag, "data-duration");
+      const src = extractAttr(tag, "src") ?? "unknown";
+      if (!trackStr || !startStr) continue;
+
+      const trackIndex = parseInt(trackStr, 10);
+      const start = parseFloat(startStr);
+      // Runtime falls back to Infinity when data-duration is absent (plays full track).
+      // Mirror that here so audio without explicit duration still participates in overlap checks.
+      const duration = durStr ? parseFloat(durStr) : Infinity;
+      // Deduplicate: same audio reached from multiple HTML sources
+      const key = `${src}:${start}:${duration}:${trackIndex}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      tracks.push({ trackIndex, start, end: start + duration, src });
+    }
+  }
+
+  for (let i = 0; i < tracks.length; i++) {
+    for (let j = i + 1; j < tracks.length; j++) {
+      const a = tracks[i]!;
+      const b = tracks[j]!;
+      if (a.trackIndex !== b.trackIndex) continue;
+      if (a.start < b.end && b.start < a.end) {
+        findings.push({
+          code: "duplicate_audio_track",
+          severity: "warning",
+          message: `Multiple <audio> elements on track ${a.trackIndex} overlap (${a.src} at ${a.start}-${Number.isFinite(a.end) ? a.end.toFixed(1) : "end"}s, ${b.src} at ${b.start}-${Number.isFinite(b.end) ? b.end.toFixed(1) : "end"}s). This causes layered audio playback.`,
+          fixHint: "Use non-overlapping time windows or different track indices.",
+        });
+      }
+    }
+  }
   return findings;
 }
 

@@ -87,6 +87,19 @@ export async function createCaptureSession(
   const { browser, captureMode } = await acquireBrowser(chromeArgs, config);
 
   const page = await browser.newPage();
+  // Polyfill esbuild's keepNames helper inside the page. Tools like tsx/Bun
+  // transform this engine's source on the fly and wrap every named function
+  // with `__name(fn, "name")`. When `page.evaluate()` serializes a callback
+  // and ships it to the browser, those `__name(...)` calls would crash with
+  // `__name is not defined` because the helper only exists in Node. Defining
+  // a no-op shim once per page makes the engine work uniformly whether it is
+  // imported from compiled dist (no helper) or from source via tsx.
+  await page.evaluateOnNewDocument(() => {
+    const w = window as unknown as { __name?: <T>(fn: T, _name: string) => T };
+    if (typeof w.__name !== "function") {
+      w.__name = <T>(fn: T, _name: string): T => fn;
+    }
+  });
   const browserVersion = await browser.version();
   const expectedMajor = config?.expectedChromiumMajor;
   if (Number.isFinite(expectedMajor)) {
@@ -142,6 +155,42 @@ export async function createCaptureSession(
   };
 }
 
+/**
+ * Classify a console "Failed to load resource" error as a font-load failure.
+ *
+ * These are expected when deterministic font injection replaces Google Fonts
+ * @import URLs with embedded base64 — or when the render environment has no
+ * network access to Google Fonts. Suppressing them reduces noise in render
+ * output without hiding real asset failures (images, videos, scripts, etc.).
+ *
+ * Chrome's `msg.text()` for a failed resource is typically just
+ * `"Failed to load resource: net::ERR_FAILED"` — the URL is only on
+ * `msg.location().url`. We match against both so the filter works regardless
+ * of which form Chrome emits.
+ */
+export function isFontResourceError(type: string, text: string, locationUrl: string): boolean {
+  if (type !== "error") return false;
+  if (!text.startsWith("Failed to load resource")) return false;
+  return /fonts\.googleapis|fonts\.gstatic|\.(woff2?|ttf|otf)(\b|$)/i.test(
+    `${locationUrl} ${text}`,
+  );
+}
+
+async function pollPageExpression(
+  page: Page,
+  expression: string,
+  timeoutMs: number,
+  intervalMs: number = 100,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const ready = Boolean(await page.evaluate(expression));
+    if (ready) return true;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return Boolean(await page.evaluate(expression));
+}
+
 export async function initializeSession(session: CaptureSession): Promise<void> {
   const { page, serverUrl } = session;
 
@@ -149,13 +198,8 @@ export async function initializeSession(session: CaptureSession): Promise<void> 
   page.on("console", (msg: ConsoleMessage) => {
     const type = msg.type();
     const text = msg.text();
-
-    // Suppress font-loading 404s entirely. These are expected when deterministic
-    // font injection replaces Google Fonts @import URLs with embedded base64.
-    const isFontLoadError =
-      type === "error" &&
-      text.startsWith("Failed to load resource") &&
-      /fonts\.googleapis|fonts\.gstatic|\.woff2?(\b|$)/i.test(text);
+    const locationUrl = msg.location()?.url ?? "";
+    const isFontLoadError = isFontResourceError(type, text, locationUrl);
 
     // Other "Failed to load resource" 404s are typically non-blocking (e.g.
     // favicon, sourcemaps, optional assets). Prefix them so users know they
@@ -197,17 +241,33 @@ export async function initializeSession(session: CaptureSession): Promise<void> 
 
     const pageReadyTimeout =
       session.config?.playerReadyTimeout ?? DEFAULT_CONFIG.playerReadyTimeout;
-    await page.waitForFunction(
+    const pageReady = await pollPageExpression(
+      page,
       `!!(window.__hf && typeof window.__hf.seek === "function" && window.__hf.duration > 0)`,
-      { timeout: pageReadyTimeout },
+      pageReadyTimeout,
     );
+    if (!pageReady) {
+      throw new Error(
+        `[FrameCapture] window.__hf not ready after ${pageReadyTimeout}ms. Page must expose window.__hf = { duration, seek }.`,
+      );
+    }
 
     // Wait for all video elements to have loaded metadata (dimensions + duration)
-    // Without this, frame 0 captures videos at their 300x150 default size
-    await page.waitForFunction(
-      `document.querySelectorAll("video").length === 0 || Array.from(document.querySelectorAll("video")).every(v => v.readyState >= 1)`,
-      { timeout: pageReadyTimeout },
+    // Without this, frame 0 captures videos at their 300x150 default size.
+    // skipReadinessVideoIds excludes natively-extracted videos (e.g. HDR HEVC
+    // sources) whose frames come from ffmpeg out-of-band — Chromium may not be
+    // able to decode them at all (e.g. HEVC on Linux headless-shell).
+    const skipIdsLiteral = JSON.stringify(session.options.skipReadinessVideoIds ?? []);
+    const videosReady = await pollPageExpression(
+      page,
+      `(() => { const skip = new Set(${skipIdsLiteral}); const vids = Array.from(document.querySelectorAll("video")).filter(v => !skip.has(v.id)); return vids.length === 0 || vids.every(v => v.readyState >= 1); })()`,
+      pageReadyTimeout,
     );
+    if (!videosReady) {
+      throw new Error(
+        `[FrameCapture] video metadata not ready after ${pageReadyTimeout}ms. Video elements must load metadata before capture starts.`,
+      );
+    }
 
     await page.evaluate(`document.fonts?.ready`);
 
@@ -275,11 +335,13 @@ export async function initializeSession(session: CaptureSession): Promise<void> 
 
   // Wait for all video elements to have loaded metadata (dimensions + duration).
   // Without this, frame 0 captures videos at their 300x150 default size.
+  // See screenshot-mode comment above for why skipReadinessVideoIds exists.
+  const beginframeSkipIdsLiteral = JSON.stringify(session.options.skipReadinessVideoIds ?? []);
   const videoDeadline =
     Date.now() + (session.config?.playerReadyTimeout ?? DEFAULT_CONFIG.playerReadyTimeout);
   while (Date.now() < videoDeadline) {
     const videosReady = await page.evaluate(
-      `document.querySelectorAll("video").length === 0 || Array.from(document.querySelectorAll("video")).every(v => v.readyState >= 1)`,
+      `(() => { const skip = new Set(${beginframeSkipIdsLiteral}); const vids = Array.from(document.querySelectorAll("video")).filter(v => !skip.has(v.id)); return vids.length === 0 || vids.every(v => v.readyState >= 1); })()`,
     );
     if (videosReady) break;
     await new Promise((r) => setTimeout(r, 100));

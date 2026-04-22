@@ -9,10 +9,14 @@ export function createWaapiAdapter(): RuntimeDeterministicAdapter {
       const timeMs = Math.max(0, (Number(ctx.time) || 0) * 1000);
       for (const animation of document.getAnimations()) {
         try {
-          animation.pause();
           animation.currentTime = timeMs;
         } catch {
-          // ignore animation edge-cases
+          // ignore animations that reject currentTime writes
+        }
+        try {
+          animation.pause();
+        } catch {
+          // infinite unresolved animations can throw here until currentTime resolves
         }
       }
     },

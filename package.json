@@ -11,13 +11,15 @@
   "type": "module",
   "scripts": {
     "dev": "bun run studio",
-    "build": "bun run --filter '*' build",
+    "build": "bun run --filter '!@hyperframes/cli' build && bun run --filter @hyperframes/cli build",
     "build:producer": "bun run --filter @hyperframes/producer build",
     "studio": "bun run --filter @hyperframes/studio dev",
     "build:hyperframes-runtime": "bun run --filter @hyperframes/core build:hyperframes-runtime",
     "build:hyperframes-runtime:modular": "bun run --filter @hyperframes/core build:hyperframes-runtime:modular",
     "verify:packed-manifests": "node scripts/verify-packed-manifests.mjs",
     "set-version": "tsx scripts/set-version.ts",
+    "sync-schemas": "tsx scripts/sync-schemas.ts",
+    "sync-schemas:check": "tsx scripts/sync-schemas.ts --check",
     "lint": "oxlint . && tsx scripts/lint-skills.ts",
     "lint:skills": "tsx scripts/lint-skills.ts",
     "lint:fix": "oxlint --fix .",
@@ -26,6 +28,8 @@
     "format:check": "oxfmt --check .",
     "knip": "knip",
     "generate:previews": "tsx scripts/generate-template-previews.ts",
+    "generate:catalog-previews": "tsx scripts/generate-catalog-previews.ts",
+    "upload:docs-images": "bash scripts/upload-docs-images.sh",
     "prepare": "test -d .git && lefthook install || true"
   },
   "devDependencies": {

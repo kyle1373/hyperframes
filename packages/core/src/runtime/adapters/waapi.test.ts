@@ -67,6 +67,22 @@ describe("waapi adapter", () => {
     delete (document as any).getAnimations;
   });
 
+  it("still sets currentTime when pause throws for an unresolved infinite animation", () => {
+    const mockAnim = {
+      pause: vi.fn(() => {
+        throw new Error("invalid state");
+      }),
+      currentTime: 0,
+    };
+    (document as any).getAnimations = vi.fn(() => [mockAnim]);
+
+    const adapter = createWaapiAdapter();
+    adapter.seek({ time: 1.25 });
+
+    expect(mockAnim.currentTime).toBe(1250);
+    delete (document as any).getAnimations;
+  });
+
   it("discover is a no-op", () => {
     const adapter = createWaapiAdapter();
     expect(() => adapter.discover()).not.toThrow();
