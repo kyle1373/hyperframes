@@ -1191,8 +1191,20 @@ export async function executeRenderJob(
     // upstream, but we still resolve them defensively. Without this, the flags
     // are silently ignored at the encoder spawn sites below — see PR #268 which
     // dropped the prior baseEncoderOpts wiring.
+    //
+    // Programmatic callers can construct RenderConfig directly and bypass the
+    // CLI's mutual-exclusivity guard. If both are set we honor crf (matches the
+    // CLI semantics where --crf is the explicit override) and warn loudly so
+    // the caller doesn't get a quietly-different bitrate than they passed in.
+    if (job.config.crf != null && job.config.videoBitrate) {
+      log.warn(
+        `[Render] Both crf=${job.config.crf} and videoBitrate=${job.config.videoBitrate} were set. ` +
+          `These are mutually exclusive; honoring crf and ignoring videoBitrate. ` +
+          `Set only one to silence this warning.`,
+      );
+    }
     const effectiveQuality = job.config.crf ?? preset.quality;
-    const effectiveBitrate = job.config.videoBitrate;
+    const effectiveBitrate = job.config.crf != null ? undefined : job.config.videoBitrate;
 
     job.framesRendered = 0;
 
