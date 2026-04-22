@@ -414,6 +414,12 @@ export async function extractAllVideoFrames(
 
   const hdrInfo = analyzeCompositionHdr(videoColorSpaces);
   if (hdrInfo.hasHdr && hdrInfo.dominantTransfer) {
+    // dominantTransfer is "majority wins" — if a composition mixes PQ and HLG
+    // sources (rare but legal), the minority transfer's videos get converted
+    // with the wrong curve. We treat this as caller-error: a single composition
+    // should not mix PQ and HLG sources, the orchestrator picks one transfer
+    // for the whole render, and any source not on that curve is normalized to
+    // it. If you need both transfers, render two separate compositions.
     const targetTransfer = hdrInfo.dominantTransfer;
     const convertDir = join(options.outputDir, "_hdr_normalized");
     mkdirSync(convertDir, { recursive: true });

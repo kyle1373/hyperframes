@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { ENCODER_PRESETS, getEncoderPreset, buildEncoderArgs } from "./chunkEncoder.js";
 
 describe("ENCODER_PRESETS", () => {
@@ -356,10 +356,12 @@ describe("buildEncoderArgs HDR color space", () => {
     expect(args[paramIdx + 1]).not.toContain("max-cll");
   });
 
-  it("keeps bt709 x264-params tagging even when HDR is requested (libx264 has no HDR support)", () => {
-    // libx264 cannot embed HDR static metadata. The codec-level color tags
-    // still flip to BT.2020 (so containers describe pixels correctly), but
-    // the x264-params VUI block stays bt709 since x264 doesn't speak HDR.
+  it("strips HDR and tags as SDR/BT.709 when codec=h264 (libx264 has no HDR support)", () => {
+    // libx264 cannot encode HDR. Rather than emit a "half-HDR" file (BT.2020
+    // container tags + BT.709 VUI inside the bitstream — confusing to HDR-aware
+    // players), we strip hdr and tag the whole output as SDR/BT.709. The caller
+    // gets a warning telling them to use codec=h265 for real HDR output.
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const args = buildEncoderArgs(
       { ...baseOptions, codec: "h264", preset: "medium", quality: 23, hdr: { transfer: "pq" } },
       inputArgs,
@@ -368,6 +370,13 @@ describe("buildEncoderArgs HDR color space", () => {
     const paramIdx = args.indexOf("-x264-params");
     expect(args[paramIdx + 1]).toContain("colorprim=bt709");
     expect(args[paramIdx + 1]).not.toContain("master-display");
+    expect(args[args.indexOf("-colorspace:v") + 1]).toBe("bt709");
+    expect(args[args.indexOf("-color_primaries:v") + 1]).toBe("bt709");
+    expect(args[args.indexOf("-color_trc:v") + 1]).toBe("bt709");
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("HDR is not supported with codec=h264"),
+    );
+    warnSpy.mockRestore();
   });
 
   it("uses range conversion for HDR CPU encoding", () => {

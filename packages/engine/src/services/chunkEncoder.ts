@@ -88,6 +88,18 @@ export function buildEncoderArgs(
     useGpu = false,
   } = options;
 
+  // libx264 cannot encode HDR. If a caller passes hdr with codec=h264 we'd
+  // produce a "half-HDR" file (BT.2020 container tags but a BT.709 VUI block
+  // inside the bitstream) which confuses HDR-aware players. Strip hdr and
+  // log a warning so the caller picks h265 (the SDR-tagged output is honest).
+  if (options.hdr && codec === "h264") {
+    console.warn(
+      "[chunkEncoder] HDR is not supported with codec=h264 (libx264 has no HDR support). " +
+        "Stripping HDR metadata and tagging output as SDR/BT.709. Use codec=h265 for HDR output.",
+    );
+    options = { ...options, hdr: false };
+  }
+
   const args: string[] = [...inputArgs, "-r", String(fps)];
   const shouldUseGpu = useGpu && gpuEncoder !== null;
 
