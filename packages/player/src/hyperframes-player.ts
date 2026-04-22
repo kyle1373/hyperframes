@@ -243,12 +243,31 @@ class HyperframesPlayer extends HTMLElement {
     this.dispatchEvent(new Event("pause"));
   }
 
+  /**
+   * Move playback to `timeInSeconds`.
+   *
+   * Two transports, with different precision semantics — read this before
+   * writing assertions against `seek` from outside the player:
+   *
+   * - **Same-origin (sync) path** — when the runtime's `window.__player.seek`
+   *   is reachable, we call it directly. `timeInSeconds` is forwarded
+   *   *verbatim* (no rounding), so a same-origin scrub of `seek(7.3333)`
+   *   lands the runtime at `7.3333 s` — sub-frame precision relative to
+   *   `DEFAULT_FPS` (30). Studio scrub UIs that need fractional-frame
+   *   alignment (e.g. waveform scrubbing on long-duration audio) get the
+   *   exact requested time.
+   * - **Cross-origin (postMessage) path** — when same-origin access throws
+   *   or `__player.seek` is missing, we fall back to the postMessage bridge.
+   *   The wire protocol carries integer frames (`frame: Math.round(t × FPS)`),
+   *   so cross-origin embeds are *frame-quantized* and `seek(7.3333)` lands
+   *   at `Math.round(7.3333 × 30) / 30 ≈ 7.3333…` (same value here, but for
+   *   most fractional inputs you'll see a snap to the nearest 1/30 s).
+   *
+   * `this._currentTime` always reflects the *requested* `timeInSeconds`
+   * regardless of transport, so the controls UI shows the un-quantized value
+   * either way; the asymmetry only affects what the runtime actually paints.
+   */
   seek(timeInSeconds: number) {
-    // Prefer the same-origin sync path — `__player.seek` lands the new frame
-    // in the same task as the input event, so scrub UIs see immediate visual
-    // feedback. Cross-origin embeds (anywhere reading `contentWindow.__player`
-    // throws or returns nothing) fall back to the postMessage bridge, which
-    // preserves the original async semantics for external hosts.
     if (!this._trySyncSeek(timeInSeconds)) {
       const frame = Math.round(timeInSeconds * DEFAULT_FPS);
       this._sendControl("seek", { frame });
