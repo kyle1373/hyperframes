@@ -1,5 +1,8 @@
 import type { RuntimeTimelineLike } from "./types";
 
+const AUTHORED_DURATION_ATTR = "data-hf-authored-duration";
+const AUTHORED_END_ATTR = "data-hf-authored-end";
+
 type ReferenceExpression =
   | {
       kind: "absolute";
@@ -12,8 +15,23 @@ type ReferenceExpression =
     };
 
 function parseNumeric(value: string | null | undefined): number | null {
+  if (value == null || value === "") return null;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function parseDurationAttr(element: Element): number | null {
+  return (
+    parseNumeric(element.getAttribute("data-duration")) ??
+    parseNumeric(element.getAttribute(AUTHORED_DURATION_ATTR))
+  );
+}
+
+function parseEndAttr(element: Element): number | null {
+  return (
+    parseNumeric(element.getAttribute("data-end")) ??
+    parseNumeric(element.getAttribute(AUTHORED_END_ATTR))
+  );
 }
 
 function parseStartExpression(raw: string | null | undefined): ReferenceExpression | null {
@@ -59,12 +77,12 @@ export function createRuntimeStartTimeResolver(params: {
     const cached = durationCache.get(element);
     if (cached !== undefined) return cached;
     let resolved: number | null = null;
-    const durationAttr = parseNumeric(element.getAttribute("data-duration"));
+    const durationAttr = parseDurationAttr(element);
     if (durationAttr != null && durationAttr > 0) {
       resolved = durationAttr;
     }
     if (resolved == null || resolved <= 0) {
-      const endAttr = parseNumeric(element.getAttribute("data-end"));
+      const endAttr = parseEndAttr(element);
       if (endAttr != null) {
         const start = resolveStartForElementInternal(element, 0);
         const delta = endAttr - start;

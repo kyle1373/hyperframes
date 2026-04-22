@@ -135,6 +135,29 @@ describe("createRuntimeStartTimeResolver", () => {
       expect(resolver.resolveStartForElement(after)).toBe(5);
     });
 
+    it("uses preserved authored duration when live composition duration was sanitized", () => {
+      const slide1 = document.createElement("div");
+      slide1.id = "slide-1";
+      slide1.setAttribute("data-composition-id", "slide-1");
+      slide1.setAttribute("data-start", "0");
+      slide1.setAttribute("data-hf-authored-duration", "14");
+      document.body.appendChild(slide1);
+
+      const slide2 = document.createElement("div");
+      slide2.id = "slide-2";
+      slide2.setAttribute("data-start", "slide-1");
+      slide2.setAttribute("data-hf-authored-duration", "12");
+      document.body.appendChild(slide2);
+
+      const slide3 = document.createElement("div");
+      slide3.setAttribute("data-start", "slide-2");
+      document.body.appendChild(slide3);
+
+      const resolver = createRuntimeStartTimeResolver({});
+      expect(resolver.resolveStartForElement(slide2)).toBe(14);
+      expect(resolver.resolveStartForElement(slide3)).toBe(26);
+    });
+
     it("returns fallback when reference target not found", () => {
       const el = document.createElement("div");
       el.setAttribute("data-start", "nonexistent");
@@ -226,6 +249,16 @@ describe("createRuntimeStartTimeResolver", () => {
         timelineRegistry: { "comp-1": mockTimeline as any },
       });
       expect(resolver.resolveDurationForElement(el)).toBe(5);
+    });
+
+    it("resolves preserved authored duration when runtime stripped the public attr", () => {
+      const el = document.createElement("div");
+      el.setAttribute("data-composition-id", "comp-1");
+      el.setAttribute("data-hf-authored-duration", "9");
+      document.body.appendChild(el);
+
+      const resolver = createRuntimeStartTimeResolver({});
+      expect(resolver.resolveDurationForElement(el)).toBe(9);
     });
 
     it("caches duration results", () => {
