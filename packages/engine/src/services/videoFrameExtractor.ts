@@ -415,14 +415,20 @@ export async function extractAllVideoFrames(
   const hdrInfo = analyzeCompositionHdr(videoColorSpaces);
   if (hdrInfo.hasHdr && hdrInfo.dominantTransfer) {
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> af56a8f4 (fix(engine): reject libx264+HDR, document GPU mastering limits + mixed-transfer caller error)
     // dominantTransfer is "majority wins" — if a composition mixes PQ and HLG
     // sources (rare but legal), the minority transfer's videos get converted
     // with the wrong curve. We treat this as caller-error: a single composition
     // should not mix PQ and HLG sources, the orchestrator picks one transfer
     // for the whole render, and any source not on that curve is normalized to
     // it. If you need both transfers, render two separate compositions.
+<<<<<<< HEAD
 =======
 >>>>>>> 2afdab1e (feat(engine): wire options.hdr through chunkEncoder + dynamic SDR→HDR transfer)
+=======
+>>>>>>> af56a8f4 (fix(engine): reject libx264+HDR, document GPU mastering limits + mixed-transfer caller error)
     const targetTransfer = hdrInfo.dominantTransfer;
     const convertDir = join(options.outputDir, "_hdr_normalized");
     mkdirSync(convertDir, { recursive: true });

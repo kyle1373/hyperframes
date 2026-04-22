@@ -357,18 +357,24 @@ describe("buildEncoderArgs HDR color space", () => {
   });
 
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> af56a8f4 (fix(engine): reject libx264+HDR, document GPU mastering limits + mixed-transfer caller error)
   it("strips HDR and tags as SDR/BT.709 when codec=h264 (libx264 has no HDR support)", () => {
     // libx264 cannot encode HDR. Rather than emit a "half-HDR" file (BT.2020
     // container tags + BT.709 VUI inside the bitstream — confusing to HDR-aware
     // players), we strip hdr and tag the whole output as SDR/BT.709. The caller
     // gets a warning telling them to use codec=h265 for real HDR output.
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+<<<<<<< HEAD
 =======
   it("keeps bt709 x264-params tagging even when HDR is requested (libx264 has no HDR support)", () => {
     // libx264 cannot embed HDR static metadata. The codec-level color tags
     // still flip to BT.2020 (so containers describe pixels correctly), but
     // the x264-params VUI block stays bt709 since x264 doesn't speak HDR.
 >>>>>>> 2afdab1e (feat(engine): wire options.hdr through chunkEncoder + dynamic SDR→HDR transfer)
+=======
+>>>>>>> af56a8f4 (fix(engine): reject libx264+HDR, document GPU mastering limits + mixed-transfer caller error)
     const args = buildEncoderArgs(
       { ...baseOptions, codec: "h264", preset: "medium", quality: 23, hdr: { transfer: "pq" } },
       inputArgs,
@@ -378,6 +384,9 @@ describe("buildEncoderArgs HDR color space", () => {
     expect(args[paramIdx + 1]).toContain("colorprim=bt709");
     expect(args[paramIdx + 1]).not.toContain("master-display");
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> af56a8f4 (fix(engine): reject libx264+HDR, document GPU mastering limits + mixed-transfer caller error)
     expect(args[args.indexOf("-colorspace:v") + 1]).toBe("bt709");
     expect(args[args.indexOf("-color_primaries:v") + 1]).toBe("bt709");
     expect(args[args.indexOf("-color_trc:v") + 1]).toBe("bt709");
@@ -385,8 +394,11 @@ describe("buildEncoderArgs HDR color space", () => {
       expect.stringContaining("HDR is not supported with codec=h264"),
     );
     warnSpy.mockRestore();
+<<<<<<< HEAD
 =======
 >>>>>>> 2afdab1e (feat(engine): wire options.hdr through chunkEncoder + dynamic SDR→HDR transfer)
+=======
+>>>>>>> af56a8f4 (fix(engine): reject libx264+HDR, document GPU mastering limits + mixed-transfer caller error)
   });
 
   it("uses range conversion for HDR CPU encoding", () => {
