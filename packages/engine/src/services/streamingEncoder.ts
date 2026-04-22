@@ -397,10 +397,23 @@ export async function spawnStreamingEncoder(
     },
 
     close: async (): Promise<StreamingEncoderResult> => {
+      // INVARIANT: close() is idempotent. The renderOrchestrator HDR cleanup
+      // path tracks an `encoderClosed` flag and may still re-call close() in
+      // the outer finally if the inner cleanup raised before the flag flipped.
+      // Each step here must be safe to repeat:
+      //   - clearTimeout: safe to call on an already-cleared/fired timer
+      //   - removeEventListener: no-op if the listener was already removed
+      //     (and {once: true} would have removed it on the first abort anyway)
+      //   - stdin.end gated on !destroyed: skipped on the second call
+      //   - exitPromise: a single shared Promise; awaiting an already-resolved
+      //     Promise resolves immediately with the same captured exitCode
+      // The returned StreamingEncoderResult is therefore consistent across
+      // repeated calls. If you change this method, preserve idempotency or
+      // a regression here will silently double-close ffmpeg and produce
+      // harder-to-trace errors at the orchestrator layer.
       clearTimeout(timer);
       if (signal) signal.removeEventListener("abort", onAbort);
 
-      // Close stdin to signal end of input
       const stdin = ffmpeg.stdin;
       if (stdin && !stdin.destroyed) {
         await new Promise<void>((resolve) => {
@@ -408,7 +421,6 @@ export async function spawnStreamingEncoder(
         });
       }
 
-      // Wait for FFmpeg to finish
       await exitPromise;
 
       const durationMs = Date.now() - startTime;
