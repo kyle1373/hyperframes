@@ -626,10 +626,22 @@ class HyperframesPlayer extends HTMLElement {
    * before issuing a `currentTime` write. A value of 2 means a single
    * spike (one slow bridge tick, one tab-throttled rAF batch, one GC pause)
    * is absorbed without a seek; sustained drift still corrects on the very
-   * next tick after the threshold is crossed twice in a row. Bridge sample
-   * cadence is `bridgeMaxPostIntervalMs: 80`, so worst-case correction
-   * latency is ~160 ms — still well under the human shot-change tolerance
-   * for A/V re-sync.
+   * next tick after the threshold is crossed twice in a row.
+   *
+   * **Coupling with the timeline-control bridge** — read before changing:
+   *   worst_case_correction_latency_ms
+   *     ≈ MIRROR_REQUIRED_CONSECUTIVE_DRIFT_SAMPLES × bridgeMaxPostIntervalMs
+   *
+   * `bridgeMaxPostIntervalMs` (currently `80`) lives at
+   * `packages/core/src/runtime/state.ts` (field on `RuntimeState`). At
+   * today's values, worst-case is `2 × 80 ms = 160 ms` — still well under
+   * the human shot-change tolerance for A/V re-sync. If you bump bridge
+   * cadence (raising `bridgeMaxPostIntervalMs`) you may need to drop this
+   * constant to `1` to keep the product under ~150 ms; if you tighten
+   * cadence you can raise this to absorb more jitter without perceptual
+   * cost. There is a back-reference in `state.ts` next to
+   * `bridgeMaxPostIntervalMs` so a change to either side surfaces the
+   * coupling.
    */
   private static readonly MIRROR_REQUIRED_CONSECUTIVE_DRIFT_SAMPLES = 2;
 
