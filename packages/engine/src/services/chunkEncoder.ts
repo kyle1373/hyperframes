@@ -97,7 +97,7 @@ export function buildEncoderArgs(
       "[chunkEncoder] HDR is not supported with codec=h264 (libx264 has no HDR support). " +
         "Stripping HDR metadata and tagging output as SDR/BT.709. Use codec=h265 for HDR output.",
     );
-    options = { ...options, hdr: false };
+    options = { ...options, hdr: undefined };
   }
 
   const args: string[] = [...inputArgs, "-r", String(fps)];
